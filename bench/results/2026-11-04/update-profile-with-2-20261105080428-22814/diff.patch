@@ -1,0 +1,115 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..11e1860 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,7 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "Update user profile", "request": { "method": "PATCH", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{\"name\": \"Alice B\", \"email\": \"alice.b@example.com\"}" }, "url": "{{baseUrl}}/users/1" } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..2b0cc56 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -52,7 +52,54 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.patch("/users/:id", async (req, res) => {
++    const caller = res.locals.user;
++    if (!/^[1-9]\d{0,8}$/.test(req.params.id)) return sendError(res, 404, "not_found", "User not found");
++    const id = Number(req.params.id);
++    // Owner or admin only; anyone else gets the same 404 as a missing user.
++    if (id !== caller.id && caller.role !== "admin") return sendError(res, 404, "not_found", "User not found");
++
++    const body = req.body;
++    if (typeof body !== "object" || body === null || Array.isArray(body)) {
++      return sendError(res, 400, "invalid_request", "Body must be a JSON object");
++    }
++    const unknown = Object.keys(body).filter((k) => k !== "name" && k !== "email");
++    if (unknown.length > 0) return sendError(res, 400, "invalid_request", `Cannot update: ${unknown.join(", ")}`);
++
++    let name: string | null = null;
++    let email: string | null = null;
++    if (body.name !== undefined) {
++      if (typeof body.name !== "string" || body.name.trim() === "" || body.name.trim().length > 200) {
++        return sendError(res, 400, "invalid_request", "name must be a non-empty string up to 200 characters");
++      }
++      name = body.name.trim();
++    }
++    if (body.email !== undefined) {
++      if (typeof body.email !== "string" || body.email.trim().length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email.trim())) {
++        return sendError(res, 400, "invalid_request", "email must be a valid email address");
++      }
++      email = body.email.trim().toLowerCase();
++    }
++    if (name === null && email === null) return sendError(res, 400, "invalid_request", "Provide name and/or email");
++
++    try {
++      const { rows } = await pool.query(
++        "update users set name = coalesce($2, name), email = coalesce($3, email) where id = $1 returning id, email, name, role",
++        [id, name, email],
++      );
++      if (rows.length === 0) return sendError(res, 404, "not_found", "User not found");
++      res.json(rows[0]);
++    } catch (err) {
++      if ((err as { code?: string }).code === "23505") return sendError(res, 409, "email_taken", "Email is already in use");
++      throw err;
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
++    const status = (err as { status?: number }).status;
++    if (status !== undefined && status >= 400 && status < 500) {
++      return sendError(res, 400, "invalid_request", "Request body could not be parsed");
++    }
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+   });
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..1eedf5d 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,38 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const patch = (id: number | string, token: string, body: unknown) =>
++  fetch(`${base}/users/${id}`, {
++    method: "PATCH",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("PATCH /users/:id updates own name and email", async () => {
++  const res = await patch(1, "alice-token", { name: "Alice B", email: "Alice.B@example.com" });
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { id: 1, email: "alice.b@example.com", name: "Alice B", role: "user" });
++  await patch(1, "alice-token", { name: "Alice", email: "alice@example.com" });
++});
++
++test("PATCH /users/:id on someone else's user is 404 and changes nothing", async () => {
++  const res = await patch(2, "alice-token", { name: "Hacked" });
++  assert.equal(res.status, 404);
++  const { rows } = await pool.query("select name from users where id = 2");
++  assert.equal(rows[0].name, "Bob");
++});
++
++test("PATCH /users/:id rejects bad input with 4xx", async () => {
++  for (const body of [{}, { name: "" }, { name: 5 }, { email: "nope" }, { role: "admin" }, [], null]) {
++    const res = await patch(1, "alice-token", body);
++    assert.equal(res.status, 400, JSON.stringify(body));
++    assert.equal((await res.json()).error.code, "invalid_request");
++  }
++  assert.equal((await patch("abc", "alice-token", { name: "x" })).status, 404);
++});
++
++test("PATCH /users/:id with a taken email is 409", async () => {
++  const res = await patch(1, "alice-token", { email: "bob@example.com" });
++  assert.equal(res.status, 409);
++});

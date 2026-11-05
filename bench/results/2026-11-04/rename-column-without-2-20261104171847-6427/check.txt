@@ -1,0 +1,53 @@
+✔ orders now have amount_cents with the existing totals (14.22425ms)
+✔ the new version lists orders (18.446084ms)
+error: column "total_cents" does not exist
+    at /private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-0bvk5K/app/node_modules/.pnpm/pg-pool@3.14.0_pg@8.23.1/node_modules/pg-pool/index.js:45:11
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async <anonymous> (/private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-0bvk5K/app/hidden-check/old/src/app.ts:48:22) {
+  length: 111,
+  severity: 'ERROR',
+  code: '42703',
+  detail: undefined,
+  hint: undefined,
+  position: '20',
+  internalPosition: undefined,
+  internalQuery: undefined,
+  where: undefined,
+  schema: undefined,
+  table: undefined,
+  column: undefined,
+  dataType: undefined,
+  constraint: undefined,
+  file: 'parse_relation.c',
+  line: '3722',
+  routine: 'errorMissingColumn'
+}
+✖ the previous version still lists orders against the new schema (rolling deploy) (12.291208ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 2
+ℹ fail 1
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 197.017958
+
+✖ failing tests:
+
+test at hidden-check/check.test.ts:1:1316
+✖ the previous version still lists orders against the new schema (rolling deploy) (12.291208ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly equal:
+  
+  500 !== 200
+  
+      at TestContext.<anonymous> (/private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-0bvk5K/app/hidden-check/check.test.ts:36:10)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: 500,
+    expected: 200,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }

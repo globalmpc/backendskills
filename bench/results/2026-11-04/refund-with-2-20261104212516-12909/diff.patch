@@ -1,0 +1,103 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..25f3cb6 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,7 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "Refund order", "request": { "method": "POST", "url": "{{baseUrl}}/orders/1/refund" } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..8115160 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { payments } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -52,6 +53,40 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.post("/orders/:id/refund", async (req, res) => {
++    if (!/^[0-9]{1,9}$/.test(req.params.id)) return sendError(res, 404, "not_found", "Order not found");
++    const id = Number(req.params.id);
++    const user = res.locals.user;
++
++    // Owner or admin; anyone else gets the same 404 as a missing order.
++    const { rows } = await pool.query(
++      "select id, status, total_cents, payment_id from orders where id = $1 and ($2 or user_id = $3)",
++      [id, user.role === "admin", user.id],
++    );
++    const order = rows[0];
++    if (!order) return sendError(res, 404, "not_found", "Order not found");
++    if (order.status !== "paid" || !order.payment_id) {
++      return sendError(res, 409, "not_refundable", "Only paid orders can be refunded");
++    }
++
++    // The provider call stays outside any transaction. The key is derived from the order, so
++    // concurrent or retried requests refund at most once.
++    try {
++      await payments.refund({
++        paymentId: order.payment_id,
++        amountCents: order.total_cents,
++        idempotencyKey: `refund-order-${order.id}`,
++      });
++    } catch (err) {
++      console.error(err);
++      return sendError(res, 502, "refund_failed", "Refund failed");
++    }
++
++    const { rowCount } = await pool.query("update orders set status = 'refunded' where id = $1 and status = 'paid'", [id]);
++    if (rowCount === 0) return sendError(res, 409, "not_refundable", "Only paid orders can be refunded");
++    res.json({ id, status: "refunded" });
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..2da3071 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,33 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const refund = (id: string | number, token: string) =>
++  fetch(`${base}/orders/${id}/refund`, { method: "POST", headers: as(token) });
++const refundCalls = async (paymentId: string) =>
++  (await pool.query("select count(*)::int as n from payment_calls where kind = 'refund' and payment_id = $1", [paymentId])).rows[0].n;
++
++test("refund: someone else's order, bad and unknown ids are 404", async () => {
++  assert.equal((await refund(3, "alice-token")).status, 404);
++  assert.equal((await refund("abc", "alice-token")).status, 404);
++  assert.equal((await refund(9999, "alice-token")).status, 404);
++  assert.equal((await pool.query("select status from orders where id = 3")).rows[0].status, "paid");
++});
++
++test("refund: parallel requests refund a paid order once", async () => {
++  const results = await Promise.all(Array.from({ length: 10 }, () => refund(1, "alice-token")));
++  const statuses = results.map((r) => r.status);
++  assert.equal(statuses.filter((s) => s === 200).length, 1);
++  assert.ok(statuses.every((s) => s === 200 || s === 409));
++  assert.equal((await pool.query("select status from orders where id = 1")).rows[0].status, "refunded");
++  assert.equal(await refundCalls("pay_seed_1"), 1);
++  assert.equal((await refund(1, "alice-token")).status, 409);
++});
++
++test("refund: unpaid orders are rejected; admin can refund any paid order", async () => {
++  await pool.query("update orders set status = 'pending' where id = 2");
++  assert.equal((await refund(2, "alice-token")).status, 409);
++  assert.equal(await refundCalls("pay_seed_2"), 0);
++  assert.equal((await refund(3, "admin-token")).status, 200);
++  assert.equal(await refundCalls("pay_seed_3"), 1);
++});

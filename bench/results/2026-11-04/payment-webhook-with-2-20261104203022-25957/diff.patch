@@ -1,0 +1,183 @@
+diff --git a/migrations/002_webhook_events.sql b/migrations/002_webhook_events.sql
+new file mode 100644
+index 0000000..8cedce0
+--- /dev/null
++++ b/migrations/002_webhook_events.sql
+@@ -0,0 +1,7 @@
++-- Provider webhook events we have already handled; the primary key makes redelivery a no-op.
++create table webhook_events (
++  id text primary key,
++  type text not null,
++  payment_id text not null,
++  received_at timestamptz not null default now()
++);
+diff --git a/migrations/down/002_webhook_events.sql b/migrations/down/002_webhook_events.sql
+new file mode 100644
+index 0000000..96c24bd
+--- /dev/null
++++ b/migrations/down/002_webhook_events.sql
+@@ -0,0 +1 @@
++drop table webhook_events;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..1bd5cff 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,7 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "Payment webhook", "request": { "method": "POST", "auth": { "type": "noauth" }, "header": [{ "key": "Provider-Signature", "value": "<hex HMAC-SHA256 of the raw body>" }, { "key": "Content-Type", "value": "application/json" }], "url": "{{baseUrl}}/webhooks/payments", "body": { "mode": "raw", "raw": "{ \"id\": \"evt_123\", \"type\": \"charge.succeeded\", \"paymentId\": \"pay_123\", \"created\": 1762300000 }" } } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..2a484fd 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,7 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
++import { createHmac, timingSafeEqual } from "node:crypto";
+ import { pool } from "./db.ts";
++import { webhookSecret } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -25,14 +27,76 @@ async function auth(req: Request, res: Response, next: NextFunction) {
+   next();
+ }
+ 
++// Webhook event type -> new order status, and the statuses it may move the order from.
++// Only forward moves are allowed, so late or reordered events can't undo a later state.
++const TRANSITIONS: Record<string, { status: string; from: string[] } | undefined> = {
++  "charge.succeeded": { status: "paid", from: ["pending"] },
++  "charge.failed": { status: "failed", from: ["pending"] },
++  "charge.refunded": { status: "refunded", from: ["pending", "paid"] },
++};
++
+ export function createApp() {
+   const app = express();
+-  app.use(express.json());
++  app.use(
++    express.json({
++      verify: (req, _res, buf) => {
++        (req as Request & { rawBody?: Buffer }).rawBody = buf;
++      },
++    }),
++  );
+ 
+   app.get("/health", (_req, res) => {
+     res.json({ ok: true });
+   });
+ 
++  app.post("/webhooks/payments", async (req, res) => {
++    const raw = (req as Request & { rawBody?: Buffer }).rawBody;
++    const header = req.headers["provider-signature"];
++    const expected = raw ? createHmac("sha256", webhookSecret).update(raw).digest() : null;
++    const given = typeof header === "string" && /^[0-9a-fA-F]{64}$/.test(header) ? Buffer.from(header, "hex") : null;
++    if (!expected || !given || !timingSafeEqual(expected, given)) {
++      return sendError(res, 401, "invalid_signature", "Invalid webhook signature");
++    }
++
++    const { id, type, paymentId } = req.body ?? {};
++    const target = typeof type === "string" ? TRANSITIONS[type] : undefined;
++    if (typeof id !== "string" || !id || typeof paymentId !== "string" || !paymentId || !target) {
++      return sendError(res, 400, "invalid_event", "Invalid webhook event");
++    }
++
++    const client = await pool.connect();
++    try {
++      await client.query("begin");
++      // The primary key on the event id makes a redelivered event a no-op.
++      const seen = await client.query(
++        "insert into webhook_events (id, type, payment_id) values ($1, $2, $3) on conflict do nothing",
++        [id, type, paymentId],
++      );
++      if (seen.rowCount === 0) {
++        await client.query("rollback");
++        return void res.json({ received: true, duplicate: true });
++      }
++      const exists = await client.query("select 1 from orders where payment_id = $1", [paymentId]);
++      if (exists.rowCount === 0) {
++        // Roll back so the event isn't recorded: the provider retries, and the payment id may be stored by then.
++        await client.query("rollback");
++        return sendError(res, 404, "order_not_found", "No order for this payment");
++      }
++      await client.query("update orders set status = $1 where payment_id = $2 and status = any($3)", [
++        target.status,
++        paymentId,
++        target.from,
++      ]);
++      await client.query("commit");
++      res.json({ received: true });
++    } catch (err) {
++      await client.query("rollback").catch(() => {});
++      throw err;
++    } finally {
++      client.release();
++    }
++  });
++
+   app.use(auth);
+ 
+   app.get("/me", (_req, res) => {
+@@ -52,7 +116,8 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
+-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
++  app.use((err: Error & { status?: number }, _req: Request, res: Response, _next: NextFunction) => {
++    if (err.status === 400) return sendError(res, 400, "invalid_json", "Malformed request body");
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+   });
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..f800e66 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -4,7 +4,8 @@ import type { Server } from "node:http";
+ import { resetDatabase } from "../src/migrate.ts";
+ import { createApp } from "../src/app.ts";
+ import { pool } from "../src/db.ts";
+-import { payments } from "../src/payments.ts";
++import { createHmac } from "node:crypto";
++import { payments, webhookSecret } from "../src/payments.ts";
+ 
+ let server: Server;
+ let base: string;
+@@ -64,3 +65,35 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++async function hook(event: object, sign = true) {
++  const body = JSON.stringify(event);
++  const sig = createHmac("sha256", webhookSecret).update(body).digest("hex");
++  return fetch(`${base}/webhooks/payments`, {
++    method: "POST",
++    headers: { "content-type": "application/json", "provider-signature": sign ? sig : "00".repeat(32) },
++    body,
++  });
++}
++const status = async (id: number) => (await pool.query("select status from orders where id = $1", [id])).rows[0].status;
++const ev = (id: string, type: string, paymentId: string) => ({ id, type, paymentId, created: 1762300000 });
++
++test("webhook rejects bad signatures and bad bodies", async () => {
++  assert.equal((await hook(ev("e0", "charge.refunded", "pay_seed_1"), false)).status, 401);
++  assert.equal((await hook({ id: "e0", type: "nope", paymentId: "pay_seed_1" })).status, 400);
++  assert.equal((await hook(ev("e0", "charge.refunded", "pay_missing"))).status, 404);
++  assert.equal(await status(1), "paid");
++});
++
++test("webhook updates status, is idempotent, and never moves backwards", async () => {
++  const { rows } = await pool.query("insert into orders (user_id, total_cents, payment_id) values (1, 100, 'pay_wh') returning id");
++  const id = rows[0].id;
++  const results = await Promise.all(Array.from({ length: 10 }, () => hook(ev("e1", "charge.succeeded", "pay_wh"))));
++  assert.ok(results.every((r) => r.status === 200));
++  assert.equal(await status(id), "paid");
++  assert.equal((await hook(ev("e2", "charge.refunded", "pay_wh"))).status, 200);
++  assert.equal(await status(id), "refunded");
++  assert.equal((await hook(ev("e3", "charge.succeeded", "pay_wh"))).status, 200);
++  assert.equal((await hook(ev("e4", "charge.failed", "pay_wh"))).status, 200);
++  assert.equal(await status(id), "refunded");
++});

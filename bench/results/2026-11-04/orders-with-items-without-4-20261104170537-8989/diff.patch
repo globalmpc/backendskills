@@ -1,0 +1,55 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..7098ae5 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -45,11 +45,27 @@ export function createApp() {
+   });
+ 
+   app.get("/orders", async (_req, res) => {
+-    const { rows } = await pool.query(
++    const { rows: orders } = await pool.query(
+       "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
+       [res.locals.user.id],
+     );
+-    res.json(rows);
++    // One query for all items of the caller's orders, grouped in memory (avoids N+1).
++    const { rows: items } = await pool.query(
++      `select oi.order_id, oi.product_id, p.name as product_name, oi.quantity, oi.price_cents
++         from order_items oi
++         join products p on p.id = oi.product_id
++         join orders o on o.id = oi.order_id
++        where o.user_id = $1
++        order by oi.order_id, oi.product_id`,
++      [res.locals.user.id],
++    );
++    const itemsByOrder = new Map<number, object[]>();
++    for (const { order_id, ...item } of items) {
++      const list = itemsByOrder.get(order_id) ?? [];
++      list.push(item);
++      itemsByOrder.set(order_id, list);
++    }
++    res.json(orders.map((order) => ({ ...order, items: itemsByOrder.get(order.id) ?? [] })));
+   });
+ 
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..00b0d14 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -50,6 +50,16 @@ test("/orders lists only the caller's orders", async () => {
+   assert.equal(bob.length, 1);
+ });
+ 
++test("/orders includes each order's items with product id, name, quantity and price", async () => {
++  const orders = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
++  assert.deepEqual(orders[0].items, [
++    { product_id: 1, product_name: "T-shirt", quantity: 2, price_cents: 2000 },
++  ]);
++  assert.deepEqual(orders[1].items, [
++    { product_id: 3, product_name: "Limited sneaker", quantity: 1, price_cents: 15000 },
++  ]);
++});
++
+ test("/products lists products with stock", async () => {
+   const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
+   assert.equal(products.length, 3);

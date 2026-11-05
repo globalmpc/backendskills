@@ -1,0 +1,52 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..e88b105 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -46,7 +46,24 @@ export function createApp() {
+ 
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+-      "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
++      `select o.id, o.status, o.total_cents, o.created_at,
++              coalesce(
++                json_agg(
++                  json_build_object(
++                    'product_id', p.id,
++                    'product_name', p.name,
++                    'quantity', oi.quantity,
++                    'price_cents', oi.price_cents
++                  ) order by p.id
++                ) filter (where oi.order_id is not null),
++                '[]'
++              ) as items
++         from orders o
++         left join order_items oi on oi.order_id = o.id
++         left join products p on p.id = oi.product_id
++        where o.user_id = $1
++        group by o.id
++        order by o.id`,
+       [res.locals.user.id],
+     );
+     res.json(rows);
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..b52f359 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -50,6 +50,17 @@ test("/orders lists only the caller's orders", async () => {
+   assert.equal(bob.length, 1);
+ });
+ 
++test("/orders includes each order's items with product id, name, quantity and price", async () => {
++  const orders = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
++  const first = orders.find((o: { id: number }) => o.id === 1);
++  assert.deepEqual(first.items, [
++    { product_id: 1, product_name: "T-shirt", quantity: 2, price_cents: 2000 },
++  ]);
++  const bobOrders = await (await fetch(`${base}/orders`, { headers: as("bob-token") })).json();
++  assert.equal(bobOrders[0].items.length, 1);
++  assert.equal(bobOrders[0].items[0].product_name, "Mug");
++});
++
+ test("/products lists products with stock", async () => {
+   const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
+   assert.equal(products.length, 3);

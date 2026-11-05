@@ -1,0 +1,201 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..4704222 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -6,12 +6,22 @@
+   "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }] },
+   "variable": [
+     { "key": "baseUrl", "value": "http://localhost:3000" },
+-    { "key": "token", "value": "alice-token" }
++    { "key": "token", "value": "alice-token" },
++    { "key": "userId", "value": "1" }
+   ],
+   "item": [
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    {
++      "name": "Update user profile",
++      "request": {
++        "method": "PATCH",
++        "url": "{{baseUrl}}/users/{{userId}}",
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "body": { "mode": "raw", "raw": "{\n  \"name\": \"Alice B\",\n  \"email\": \"alice.b@example.com\"\n}" }
++      }
++    }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..5196ba6 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -3,6 +3,8 @@ import { pool } from "./db.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
++const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
++
+ declare global {
+   namespace Express {
+     interface Locals {
+@@ -52,7 +54,65 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.patch("/users/:id", async (req, res) => {
++    const id = /^[1-9]\d*$/.test(req.params.id) ? Number(req.params.id) : NaN;
++    if (!Number.isSafeInteger(id) || id > 2147483647) return sendError(res, 400, "invalid_id", "User id must be a number");
++
++    // Only the user themself or an admin may change a profile. Anyone else gets the same 404 as a missing user.
++    const caller = res.locals.user;
++    if (caller.id !== id && caller.role !== "admin") return sendError(res, 404, "not_found", "User not found");
++
++    const body = req.body;
++    if (typeof body !== "object" || body === null || Array.isArray(body)) {
++      return sendError(res, 400, "invalid_body", "Body must be a JSON object");
++    }
++    const unknown = Object.keys(body).filter((key) => key !== "name" && key !== "email");
++    if (unknown.length > 0) {
++      return sendError(res, 400, "unknown_field", `Cannot change: ${unknown.join(", ")}`);
++    }
++
++    let name: string | null = null;
++    if (body.name !== undefined) {
++      if (typeof body.name !== "string" || body.name.trim() === "" || body.name.trim().length > 200) {
++        return sendError(res, 400, "invalid_name", "Name must be 1 to 200 characters");
++      }
++      name = body.name.trim();
++    }
++
++    let email: string | null = null;
++    if (body.email !== undefined) {
++      const normalized = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
++      if (!EMAIL_PATTERN.test(normalized) || normalized.length > 254) {
++        return sendError(res, 400, "invalid_email", "Email is not valid");
++      }
++      email = normalized;
++    }
++
++    if (name === null && email === null) {
++      return sendError(res, 400, "no_fields", "Send name or email");
++    }
++
++    try {
++      // One statement: the database applies the change and enforces the unique email.
++      const { rows } = await pool.query(
++        `update users set name = coalesce($2, name), email = coalesce($3, email)
++         where id = $1 returning id, email, name, role`,
++        [id, name, email],
++      );
++      if (rows.length === 0) return sendError(res, 404, "not_found", "User not found");
++      res.json(rows[0]);
++    } catch (err) {
++      if ((err as { code?: string }).code === "23505") {
++        return sendError(res, 409, "email_taken", "Email is already in use");
++      }
++      throw err;
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
++    if ((err as { type?: string }).type === "entity.parse.failed") {
++      return sendError(res, 400, "invalid_json", "Body must be valid JSON");
++    }
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+   });
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..1ab923b 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,88 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const patch = (token: string, path: string, body: unknown) =>
++  fetch(`${base}${path}`, {
++    method: "PATCH",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: typeof body === "string" ? body : JSON.stringify(body),
++  });
++
++const row = async (id: number) =>
++  (await pool.query("select email, name, role, api_token, password_hash from users where id = $1", [id])).rows[0];
++
++test("PATCH /users/:id without a token gets 401", async () => {
++  const res = await patch("nope", "/users/1", { name: "X" });
++  assert.equal(res.status, 401);
++});
++
++test("users can update their own name and email; the response has no secrets", async () => {
++  const res = await patch("alice-token", "/users/1", { name: "  Alice B  ", email: " Alice.B@Example.com " });
++  assert.equal(res.status, 200);
++  const body = await res.json();
++  assert.deepEqual(body, { id: 1, email: "alice.b@example.com", name: "Alice B", role: "user" });
++  const stored = await row(1);
++  assert.equal(stored.email, "alice.b@example.com");
++  assert.equal(stored.name, "Alice B");
++});
++
++test("a user cannot change someone else's profile: 404 and nothing changes", async () => {
++  const before = await row(1);
++  const res = await patch("bob-token", "/users/1", { name: "Hacked" });
++  assert.equal(res.status, 404);
++  assert.deepEqual(await res.json(), { error: { code: "not_found", message: "User not found" } });
++  assert.deepEqual(await row(1), before);
++});
++
++test("an admin can update another user", async () => {
++  const res = await patch("admin-token", "/users/2", { name: "Bobby" });
++  assert.equal(res.status, 200);
++  assert.equal((await res.json()).name, "Bobby");
++  assert.equal((await row(2)).name, "Bobby");
++});
++
++test("changing email to one in use gets 409 and nothing changes", async () => {
++  const before = await row(2);
++  const res = await patch("bob-token", "/users/2", { email: "alice.b@example.com" });
++  assert.equal(res.status, 409);
++  assert.deepEqual(await res.json(), { error: { code: "email_taken", message: "Email is already in use" } });
++  assert.deepEqual(await row(2), before);
++});
++
++test("role, token and password cannot be changed through the profile endpoint", async () => {
++  const before = await row(2);
++  const res = await patch("bob-token", "/users/2", { name: "Bob", role: "admin", api_token: "x", password_hash: "x" });
++  assert.equal(res.status, 400);
++  assert.equal((await res.json()).error.code, "unknown_field");
++  assert.deepEqual(await row(2), before);
++});
++
++test("bad input gets a 4xx, never a 500", async () => {
++  const cases: [string, unknown, string][] = [
++    ["/users/2", {}, "no_fields"],
++    ["/users/2", { name: "" }, "invalid_name"],
++    ["/users/2", { name: "   " }, "invalid_name"],
++    ["/users/2", { name: 5 }, "invalid_name"],
++    ["/users/2", { name: "x".repeat(201) }, "invalid_name"],
++    ["/users/2", { email: "not-an-email" }, "invalid_email"],
++    ["/users/2", { email: null }, "invalid_email"],
++    ["/users/2", ["Bob"], "invalid_body"],
++    ["/users/2", "null", "invalid_json"],
++    ["/users/2", "{name:", "invalid_json"],
++    ["/users/abc", { name: "X" }, "invalid_id"],
++    ["/users/0", { name: "X" }, "invalid_id"],
++    ["/users/1.5", { name: "X" }, "invalid_id"],
++    ["/users/99999999999", { name: "X" }, "invalid_id"],
++  ];
++  for (const [path, body, code] of cases) {
++    const res = await patch("admin-token", path, body);
++    assert.equal(res.status, 400, `${path} ${JSON.stringify(body)}`);
++    assert.equal((await res.json()).error.code, code, `${path} ${JSON.stringify(body)}`);
++  }
++});
++
++test("an admin patching a missing user gets 404", async () => {
++  const res = await patch("admin-token", "/users/999", { name: "X" });
++  assert.equal(res.status, 404);
++});

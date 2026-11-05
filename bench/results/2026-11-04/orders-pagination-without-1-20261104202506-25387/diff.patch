@@ -1,0 +1,104 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..a1c243d 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -25,6 +25,24 @@ async function auth(req: Request, res: Response, next: NextFunction) {
+   next();
+ }
+ 
++const ORDERS_PAGE_SIZE = 20;
++
++function encodeCursor(createdAt: string, id: number): string {
++  return Buffer.from(JSON.stringify([createdAt, id])).toString("base64url");
++}
++
++function decodeCursor(raw: unknown): { createdAt: string; id: number } | null {
++  if (typeof raw !== "string") return null;
++  try {
++    const [createdAt, id] = JSON.parse(Buffer.from(raw, "base64url").toString());
++    if (typeof createdAt !== "string" || !Number.isInteger(id) || id < 1 || id > 2147483647) return null;
++    if (Number.isNaN(Date.parse(createdAt))) return null;
++    return { createdAt, id };
++  } catch {
++    return null;
++  }
++}
++
+ export function createApp() {
+   const app = express();
+   app.use(express.json());
+@@ -44,12 +62,27 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
+-  app.get("/orders", async (_req, res) => {
++  app.get("/orders", async (req, res) => {
++    const params: unknown[] = [res.locals.user.id, ORDERS_PAGE_SIZE + 1];
++    let after = "";
++    if (req.query.cursor !== undefined) {
++      const cursor = decodeCursor(req.query.cursor);
++      if (!cursor) return sendError(res, 400, "invalid_cursor", "Invalid cursor");
++      params.push(cursor.createdAt, cursor.id);
++      after = "and (created_at, id) < ($3::timestamptz, $4::integer)";
++    }
++    // created_at::text keeps full microsecond precision for the cursor (JS Dates only have ms).
+     const { rows } = await pool.query(
+-      "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
+-      [res.locals.user.id],
++      `select id, status, total_cents, created_at, created_at::text as cursor_ts
++       from orders where user_id = $1 ${after}
++       order by created_at desc, id desc limit $2`,
++      params,
+     );
+-    res.json(rows);
++    const hasMore = rows.length > ORDERS_PAGE_SIZE;
++    const page = rows.slice(0, ORDERS_PAGE_SIZE);
++    const last = page[page.length - 1];
++    const orders = page.map(({ cursor_ts: _ts, ...order }) => order);
++    res.json({ orders, nextCursor: hasMore ? encodeCursor(last.cursor_ts, last.id) : null });
+   });
+ 
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..29debfa 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -46,8 +46,36 @@ test("/me returns the caller", async () => {
+ test("/orders lists only the caller's orders", async () => {
+   const alice = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
+   const bob = await (await fetch(`${base}/orders`, { headers: as("bob-token") })).json();
+-  assert.equal(alice.length, 2);
+-  assert.equal(bob.length, 1);
++  assert.equal(alice.orders.length, 2);
++  assert.equal(alice.nextCursor, null);
++  assert.equal(bob.orders.length, 1);
++});
++
++test("/orders paginates newest first, 20 per page", async () => {
++  await pool.query(
++    `insert into orders (user_id, total_cents, created_at)
++     select u.id, 100, now() + (g || ' seconds')::interval
++     from users u, generate_series(1, 45) g where u.email = 'bob@example.com'`,
++  );
++  const seen: { id: number; created_at: string }[] = [];
++  let cursor: string | null = null;
++  const sizes: number[] = [];
++  do {
++    const url: string = `${base}/orders${cursor ? `?cursor=${cursor}` : ""}`;
++    const page = await (await fetch(url, { headers: as("bob-token") })).json();
++    sizes.push(page.orders.length);
++    seen.push(...page.orders);
++    cursor = page.nextCursor;
++  } while (cursor);
++  assert.deepEqual(sizes, [20, 20, 6]);
++  assert.equal(new Set(seen.map((o) => o.id)).size, 46);
++  const times = seen.map((o) => Date.parse(o.created_at));
++  assert.deepEqual(times, [...times].sort((a, b) => b - a));
++});
++
++test("/orders rejects a malformed cursor", async () => {
++  const res = await fetch(`${base}/orders?cursor=garbage`, { headers: as("bob-token") });
++  assert.equal(res.status, 400);
+ });
+ 
+ test("/products lists products with stock", async () => {

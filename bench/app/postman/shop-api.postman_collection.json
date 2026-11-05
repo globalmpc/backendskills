@@ -1,0 +1,17 @@
+{
+  "info": {
+    "name": "shop-api",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }] },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3000" },
+    { "key": "token", "value": "alice-token" }
+  ],
+  "item": [
+    { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+    { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+    { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
+  ]
+}

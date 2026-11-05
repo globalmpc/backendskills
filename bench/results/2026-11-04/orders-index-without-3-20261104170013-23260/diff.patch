@@ -1,0 +1,11 @@
+diff --git a/migrations/002_orders_user_id_index.sql b/migrations/002_orders_user_id_index.sql
+new file mode 100644
+index 0000000..1d72b36
+--- /dev/null
++++ b/migrations/002_orders_user_id_index.sql
+@@ -0,0 +1,5 @@
++-- Speeds up "orders for a user" (where user_id = $1 order by id).
++-- Built CONCURRENTLY so writes to the large orders table are not blocked.
++-- Keep this file to this single statement: CONCURRENTLY cannot run inside a
++-- transaction, and migrate.ts sends each file as one query.
++create index concurrently if not exists orders_user_id_id_idx on orders (user_id, id);

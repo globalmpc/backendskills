@@ -1,0 +1,11 @@
+diff --git a/migrations/002_orders_user_id_index.sql b/migrations/002_orders_user_id_index.sql
+new file mode 100644
+index 0000000..22365a4
+--- /dev/null
++++ b/migrations/002_orders_user_id_index.sql
+@@ -0,0 +1,5 @@
++-- Serves `select ... from orders where user_id = $1 order by id` (GET /orders).
++-- CONCURRENTLY avoids blocking writes on the large production table. It cannot run
++-- inside a transaction block; migrate.ts sends this file as a single statement, which is fine.
++-- If a build is interrupted it leaves an INVALID index: drop it and rerun the migration.
++create index concurrently if not exists orders_user_id_id_idx on orders (user_id, id);

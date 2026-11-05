@@ -1,0 +1,67 @@
+diff --git a/db/seed.sql b/db/seed.sql
+index 26e5d14..6d661c2 100644
+--- a/db/seed.sql
++++ b/db/seed.sql
+@@ -9,7 +9,7 @@ insert into products (name, price_cents, stock) values
+   ('Mug', 1200, 40),
+   ('Limited sneaker', 15000, 5);
+ 
+-insert into orders (user_id, status, total_cents, payment_id) values
++insert into orders (user_id, status, amount_cents, payment_id) values
+   (1, 'paid', 4000, 'pay_seed_1'),
+   (1, 'paid', 15000, 'pay_seed_2'),
+   (2, 'paid', 1200, 'pay_seed_3');
+diff --git a/migrations/002_orders_amount_cents.sql b/migrations/002_orders_amount_cents.sql
+new file mode 100644
+index 0000000..a5400a8
+--- /dev/null
++++ b/migrations/002_orders_amount_cents.sql
+@@ -0,0 +1,25 @@
++-- Rename orders.total_cents to amount_cents, step 1 of 2 (expand).
++-- total_cents is kept, and a trigger keeps both columns equal, so the previous app version
++-- (which still reads and writes total_cents) keeps working during the rolling deploy.
++-- Migration 003 (a later deploy) drops total_cents, once nothing reads it.
++set lock_timeout = '5s';
++
++alter table orders add column amount_cents integer;
++
++-- Trigger first, so rows written while the backfill runs are covered too.
++create function orders_sync_amount() returns trigger language plpgsql as $$
++begin
++  if tg_op = 'UPDATE' and new.total_cents is distinct from old.total_cents then
++    new.amount_cents := new.total_cents; -- a writer that still uses total_cents
++  end if;
++  new.amount_cents := coalesce(new.amount_cents, new.total_cents);
++  new.total_cents := new.amount_cents;
++  return new;
++end $$;
++
++create trigger orders_sync_amount before insert or update on orders
++  for each row execute function orders_sync_amount();
++
++update orders set amount_cents = total_cents where amount_cents is null;
++
++alter table orders alter column amount_cents set not null;
+diff --git a/migrations/down/002_orders_amount_cents.sql b/migrations/down/002_orders_amount_cents.sql
+new file mode 100644
+index 0000000..becfa00
+--- /dev/null
++++ b/migrations/down/002_orders_amount_cents.sql
+@@ -0,0 +1,4 @@
++-- Undo migrations/002_orders_amount_cents.sql, in reverse order.
++drop trigger if exists orders_sync_amount on orders;
++drop function if exists orders_sync_amount();
++alter table orders drop column if exists amount_cents;
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..228b27b 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -46,7 +46,7 @@ export function createApp() {
+ 
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+-      "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
++      "select id, status, amount_cents as total_cents, created_at from orders where user_id = $1 order by id",
+       [res.locals.user.id],
+     );
+     res.json(rows);

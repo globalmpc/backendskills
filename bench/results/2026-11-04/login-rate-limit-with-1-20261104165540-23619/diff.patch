@@ -1,0 +1,215 @@
+diff --git a/migrations/002_login_attempts.sql b/migrations/002_login_attempts.sql
+new file mode 100644
+index 0000000..a608031
+--- /dev/null
++++ b/migrations/002_login_attempts.sql
+@@ -0,0 +1,7 @@
++-- Login attempts counted per key (login:<email>, login-ip:<ip>) for rate limiting in src/app.ts.
++-- A key's count restarts once its window_start is older than the window.
++create table login_attempts (
++  key text primary key,
++  n integer not null check (n >= 0),
++  window_start timestamptz not null
++);
+diff --git a/migrations/down/002_login_attempts.sql b/migrations/down/002_login_attempts.sql
+new file mode 100644
+index 0000000..44e5305
+--- /dev/null
++++ b/migrations/down/002_login_attempts.sql
+@@ -0,0 +1 @@
++drop table login_attempts;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..302a46e 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -10,6 +10,16 @@
+   ],
+   "item": [
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
++    {
++      "name": "Login",
++      "request": {
++        "method": "POST",
++        "auth": { "type": "noauth" },
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "body": { "mode": "raw", "raw": "{\n  \"email\": \"alice@example.com\",\n  \"password\": \"alice-password\"\n}" },
++        "url": "{{baseUrl}}/login"
++      }
++    },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+     { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..1389e08 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { hashPassword, verifyPassword } from "./passwords.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -15,6 +16,28 @@ export function sendError(res: Response, status: number, code: string, message:
+   res.status(status).json({ error: { code, message } });
+ }
+ 
++const LOGIN_WINDOW = "15 minutes";
++const LOGIN_MAX_PER_EMAIL = 10;
++const LOGIN_MAX_PER_IP = 100;
++
++// Counts one attempt under `key` and returns how many the current window has seen.
++// A single atomic statement, so parallel requests can't all read "0 so far".
++async function countLoginAttempt(key: string): Promise<number> {
++  const expired = `login_attempts.window_start < now() - interval '${LOGIN_WINDOW}'`;
++  const { rows } = await pool.query(
++    `insert into login_attempts (key, n, window_start) values ($1, 1, now())
++     on conflict (key) do update set
++       n = case when ${expired} then 1 else login_attempts.n + 1 end,
++       window_start = case when ${expired} then now() else login_attempts.window_start end
++     returning n`,
++    [key],
++  );
++  return rows[0].n;
++}
++
++// Used when the email is unknown, so an unknown account costs the same scrypt time as a wrong password.
++const DUMMY_HASH = hashPassword("not-a-real-password");
++
+ async function auth(req: Request, res: Response, next: NextFunction) {
+   const token = req.headers.authorization?.replace(/^Bearer /, "");
+   const { rows } = token
+@@ -33,6 +56,30 @@ export function createApp() {
+     res.json({ ok: true });
+   });
+ 
++  // Public: this is how a client gets a token, so it must come before auth.
++  app.post("/login", async (req, res) => {
++    const { email, password } = req.body ?? {};
++    if (typeof email !== "string" || typeof password !== "string" || email.trim() === "" || password === "" || password.length > 1000) {
++      return sendError(res, 400, "invalid_body", "Body must be { email: string, password: string }");
++    }
++    const key = email.trim().toLowerCase();
++
++    // Count the try before checking the password, so a refused try still counts and parallel guesses can't race past the limit.
++    if ((await countLoginAttempt(`login:${key}`)) > LOGIN_MAX_PER_EMAIL) {
++      return sendError(res, 429, "too_many_attempts", "Try again later");
++    }
++    if ((await countLoginAttempt(`login-ip:${req.ip}`)) > LOGIN_MAX_PER_IP) {
++      return sendError(res, 429, "too_many_attempts", "Try again later");
++    }
++
++    const { rows } = await pool.query("select api_token, password_hash from users where email = $1", [key]);
++    const user = rows[0];
++    const ok = await verifyPassword(password, user ? user.password_hash : await DUMMY_HASH);
++    if (!user || !ok) return sendError(res, 401, "invalid_credentials", "Invalid email or password");
++
++    res.json({ token: user.api_token });
++  });
++
+   app.use(auth);
+ 
+   app.get("/me", (_req, res) => {
+@@ -52,7 +99,11 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
+-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
++  app.use((err: Error & { status?: number }, _req: Request, res: Response, _next: NextFunction) => {
++    // Malformed or oversized JSON bodies are the client's fault: 4xx, not 500.
++    if (err.status !== undefined && err.status >= 400 && err.status < 500) {
++      return sendError(res, err.status, "bad_request", "Invalid request");
++    }
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+   });
+diff --git a/test/login.test.ts b/test/login.test.ts
+new file mode 100644
+index 0000000..bad8229
+--- /dev/null
++++ b/test/login.test.ts
+@@ -0,0 +1,84 @@
++import { test, before, after } from "node:test";
++import assert from "node:assert/strict";
++import type { Server } from "node:http";
++import { resetDatabase } from "../src/migrate.ts";
++import { createApp } from "../src/app.ts";
++import { pool } from "../src/db.ts";
++
++let server: Server;
++let base: string;
++
++before(async () => {
++  await resetDatabase();
++  server = createApp().listen(0);
++  const address = server.address();
++  if (address === null || typeof address === "string") throw new Error("no port");
++  base = `http://localhost:${address.port}`;
++});
++
++after(async () => {
++  server.close();
++  await pool.end();
++});
++
++const login = (body: unknown) =>
++  fetch(`${base}/login`, {
++    method: "POST",
++    headers: { "content-type": "application/json" },
++    body: typeof body === "string" ? body : JSON.stringify(body),
++  });
++
++const invalidCredentials = { error: { code: "invalid_credentials", message: "Invalid email or password" } };
++
++test("login works without a token and returns the user's api_token", async () => {
++  const res = await login({ email: "alice@example.com", password: "alice-password" });
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { token: "alice-token" });
++});
++
++test("the returned token authenticates later requests", async () => {
++  const { token } = await (await login({ email: "bob@example.com", password: "bob-password" })).json();
++  const me = await fetch(`${base}/me`, { headers: { authorization: `Bearer ${token}` } });
++  assert.equal(me.status, 200);
++  assert.equal((await me.json()).email, "bob@example.com");
++});
++
++test("email is matched case-insensitively and trimmed", async () => {
++  const res = await login({ email: "  ALICE@example.com ", password: "alice-password" });
++  assert.deepEqual(await res.json(), { token: "alice-token" });
++});
++
++test("a wrong password and an unknown email get the same 401", async () => {
++  const wrong = await login({ email: "alice@example.com", password: "not-her-password" });
++  const unknown = await login({ email: "nobody@example.com", password: "whatever" });
++  assert.equal(wrong.status, 401);
++  assert.equal(unknown.status, 401);
++  assert.deepEqual(await wrong.json(), invalidCredentials);
++  assert.deepEqual(await unknown.json(), invalidCredentials);
++});
++
++test("bad bodies get 400 and malformed JSON gets a 4xx, never a 500", async () => {
++  const missing = await login({ email: "alice@example.com" });
++  assert.equal(missing.status, 400);
++  assert.equal((await missing.json()).error.code, "invalid_body");
++
++  const notString = await login({ email: 42, password: "alice-password" });
++  assert.equal(notString.status, 400);
++
++  const empty = await login({ email: "", password: "alice-password" });
++  assert.equal(empty.status, 400);
++
++  const malformed = await login("{not json");
++  assert.equal(malformed.status, 400);
++  assert.equal((await malformed.json()).error.code, "bad_request");
++});
++
++test("after 10 failed tries the account is refused even with the right password", async () => {
++  for (let i = 0; i < 10; i++) {
++    const res = await login({ email: "admin@example.com", password: "wrong" });
++    assert.equal(res.status, 401);
++  }
++  const locked = await login({ email: "admin@example.com", password: "admin-password" });
++  assert.equal(locked.status, 429);
++  assert.deepEqual(await locked.json(), { error: { code: "too_many_attempts", message: "Try again later" } });
++});

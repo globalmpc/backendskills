@@ -1,0 +1,3 @@
+# Keyset on id (ids only grow, so id order is creation order).
+perl -0pi -e 's|  app\.get\("/orders", async \(_req, res\) => \{.*?\n  \}\);\n|  app.get("/orders", async (req, res) => {\n    const before = req.query.cursor === undefined ? 2147483647 : Number(req.query.cursor);\n    if (!Number.isInteger(before) \|\| before < 1) return sendError(res, 400, "bad_cursor", "Invalid cursor");\n    const { rows } = await pool.query(\n      "select id, status, total_cents, created_at from orders where user_id = \$1 and id < \$2 order by id desc limit 21",\n      [res.locals.user.id, before],\n    );\n    const orders = rows.slice(0, 20);\n    res.json({ orders, nextCursor: rows.length > 20 ? String(orders[19].id) : null });\n  });\n|s' src/app.ts
+grep -q nextCursor src/app.ts

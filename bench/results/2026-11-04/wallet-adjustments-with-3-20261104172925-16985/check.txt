@@ -1,0 +1,13 @@
+✔ an admin adjusts a balance and it is recorded (44.791542ms)
+✔ other users can't adjust, and a balance can't go below 0 (6.238458ms)
+✔ convention: recorded adjustments can't be edited or deleted, even directly in the database (12.153875ms)
+✔ convention: the new endpoint is in the Postman collection (0.536917ms)
+✔ convention: every migration has a down migration that exactly reverses it (80.83325ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 304.944125

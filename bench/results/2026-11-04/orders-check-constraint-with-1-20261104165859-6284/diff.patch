@@ -1,0 +1,39 @@
+diff --git a/migrations/002_orders_total_nonnegative.sql b/migrations/002_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..60dc865
+--- /dev/null
++++ b/migrations/002_orders_total_nonnegative.sql
+@@ -0,0 +1,7 @@
++-- Refuse negative order totals from now on.
++-- NOT VALID: the constraint is enforced for every insert and update right away, but existing
++-- rows are not scanned here, so the table is not read under a blocking lock. 003 checks them.
++begin;
++set local lock_timeout = '5s';  -- fail and retry the deploy rather than queue behind other queries
++alter table orders add constraint orders_total_cents_nonnegative check (total_cents >= 0) not valid;
++commit;
+diff --git a/migrations/003_validate_orders_total_nonnegative.sql b/migrations/003_validate_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..7d353cb
+--- /dev/null
++++ b/migrations/003_validate_orders_total_nonnegative.sql
+@@ -0,0 +1,6 @@
++-- Check the rows that already exist. VALIDATE takes a lock that does not block reads or writes.
++-- If any existing row has a negative total_cents, this fails and the constraint stays NOT VALID.
++begin;
++set local lock_timeout = '5s';
++alter table orders validate constraint orders_total_cents_nonnegative;
++commit;
+diff --git a/migrations/down/002_orders_total_nonnegative.sql b/migrations/down/002_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..8debf32
+--- /dev/null
++++ b/migrations/down/002_orders_total_nonnegative.sql
+@@ -0,0 +1 @@
++alter table orders drop constraint if exists orders_total_cents_nonnegative;
+diff --git a/migrations/down/003_validate_orders_total_nonnegative.sql b/migrations/down/003_validate_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..ce9fc46
+--- /dev/null
++++ b/migrations/down/003_validate_orders_total_nonnegative.sql
+@@ -0,0 +1 @@
++-- Nothing to undo: validating changes no schema definition. The constraint is removed by down/002.

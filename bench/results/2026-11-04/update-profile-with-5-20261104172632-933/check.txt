@@ -1,0 +1,13 @@
+✔ users can update their own name (40.127666ms)
+✔ users can't edit someone else's profile (2.658292ms)
+✔ users can't make themselves admin (2.988875ms)
+✔ taking an email another user already has gets a 4xx, not a server error (9.10475ms)
+✔ users can't change their own login token (3.342416ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 180.66975

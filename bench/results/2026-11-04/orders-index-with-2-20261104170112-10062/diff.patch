@@ -1,0 +1,17 @@
+diff --git a/migrations/002_orders_user_id_index.sql b/migrations/002_orders_user_id_index.sql
+new file mode 100644
+index 0000000..d1313a2
+--- /dev/null
++++ b/migrations/002_orders_user_id_index.sql
+@@ -0,0 +1,3 @@
++-- Built concurrently so writes to the large orders table aren't blocked. Keep this file to this one statement:
++-- CREATE INDEX CONCURRENTLY cannot run inside a transaction.
++create index concurrently if not exists orders_user_id_idx on orders (user_id);
+diff --git a/migrations/down/002_orders_user_id_index.sql b/migrations/down/002_orders_user_id_index.sql
+new file mode 100644
+index 0000000..bdd0618
+--- /dev/null
++++ b/migrations/down/002_orders_user_id_index.sql
+@@ -0,0 +1,2 @@
++-- Reverse of 002_orders_user_id_index.sql. Keep this file to this one statement (CONCURRENTLY can't run in a transaction).
++drop index concurrently if exists orders_user_id_idx;

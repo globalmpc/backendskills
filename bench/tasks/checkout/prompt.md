@@ -1,0 +1,1 @@
+Add `POST /orders` to place an order. Body: `{ "items": [{ "productId": number, "quantity": number }] }`. Check that there is enough stock, charge the total through the payment provider, reduce the stock, and return the created order.

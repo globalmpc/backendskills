@@ -1,0 +1,43 @@
+diff --git a/migrations/002_orders_total_nonnegative.sql b/migrations/002_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..e563aa3
+--- /dev/null
++++ b/migrations/002_orders_total_nonnegative.sql
+@@ -0,0 +1,8 @@
++-- Step 1 of 2. Adds the check as NOT VALID: Postgres does not scan existing rows,
++-- so the table lock is held only briefly. New and updated rows are checked immediately.
++-- Step 2 (003) validates the existing rows without blocking reads or writes.
++-- lock_timeout keeps this from queuing behind a long transaction and stalling other queries.
++set local lock_timeout = '5s';
++
++alter table orders
++  add constraint orders_total_cents_nonnegative check (total_cents >= 0) not valid;
+diff --git a/migrations/003_validate_orders_total_nonnegative.sql b/migrations/003_validate_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..b8c14fc
+--- /dev/null
++++ b/migrations/003_validate_orders_total_nonnegative.sql
+@@ -0,0 +1,5 @@
++-- Step 2 of 2. Scans existing orders rows against the check added in 002.
++-- VALIDATE CONSTRAINT takes only a SHARE UPDATE EXCLUSIVE lock, so reads and writes continue.
++-- This must stay in its own file: the migration runner runs each file in one transaction,
++-- and holding the stronger lock from 002 for the length of this scan would block the table.
++alter table orders validate constraint orders_total_cents_nonnegative;
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..426e493 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -56,6 +56,13 @@ test("/products lists products with stock", async () => {
+   assert.equal(products.find((p: { name: string }) => p.name === "Limited sneaker").stock, 5);
+ });
+ 
++test("the database rejects an order with a negative total", async () => {
++  await assert.rejects(
++    pool.query("insert into orders (user_id, total_cents) values (1, -100)"),
++    (err: { code?: string }) => err.code === "23514",
++  );
++});
++
+ test("payments client records every call; the same idempotency key is charged once", async () => {
+   const first = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });
+   const again = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });

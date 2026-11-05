@@ -1,0 +1,1 @@
+`GET /orders` returns all of a user's orders, and some users now have thousands. Paginate it: newest first, 20 per page. Respond with `{ "orders": [...], "nextCursor": string | null }`; the client passes `?cursor=<nextCursor>` to get the next page.

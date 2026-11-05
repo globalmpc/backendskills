@@ -1,0 +1,73 @@
+diff --git a/db/seed.sql b/db/seed.sql
+index 26e5d14..6d661c2 100644
+--- a/db/seed.sql
++++ b/db/seed.sql
+@@ -9,7 +9,7 @@ insert into products (name, price_cents, stock) values
+   ('Mug', 1200, 40),
+   ('Limited sneaker', 15000, 5);
+ 
+-insert into orders (user_id, status, total_cents, payment_id) values
++insert into orders (user_id, status, amount_cents, payment_id) values
+   (1, 'paid', 4000, 'pay_seed_1'),
+   (1, 'paid', 15000, 'pay_seed_2'),
+   (2, 'paid', 1200, 'pay_seed_3');
+diff --git a/migrations/002_orders_amount_cents.sql b/migrations/002_orders_amount_cents.sql
+new file mode 100644
+index 0000000..03463f3
+--- /dev/null
++++ b/migrations/002_orders_amount_cents.sql
+@@ -0,0 +1,23 @@
++-- Expand step of renaming orders.total_cents -> orders.amount_cents.
++-- total_cents stays until a later deploy (contract step) so the previous app version keeps working.
++set lock_timeout = '5s';
++
++alter table orders add column amount_cents integer;
++
++-- Keep both columns in sync while old and new app versions run side by side.
++create function orders_sync_amount_cents() returns trigger language plpgsql as $$
++begin
++  if new.amount_cents is null then
++    new.amount_cents := new.total_cents;
++  elsif new.total_cents is null then
++    new.total_cents := new.amount_cents;
++  elsif tg_op = 'UPDATE' and new.amount_cents is distinct from old.amount_cents then
++    new.total_cents := new.amount_cents;
++  elsif tg_op = 'UPDATE' and new.total_cents is distinct from old.total_cents then
++    new.amount_cents := new.total_cents;
++  end if;
++  return new;
++end $$;
++
++create trigger orders_sync_amount_cents before insert or update on orders
++  for each row execute function orders_sync_amount_cents();
+diff --git a/migrations/down/002_orders_amount_cents.sql b/migrations/down/002_orders_amount_cents.sql
+new file mode 100644
+index 0000000..2e97ed9
+--- /dev/null
++++ b/migrations/down/002_orders_amount_cents.sql
+@@ -0,0 +1,3 @@
++drop trigger orders_sync_amount_cents on orders;
++drop function orders_sync_amount_cents();
++alter table orders drop column amount_cents;
+diff --git a/scripts/backfill-orders-amount-cents.sql b/scripts/backfill-orders-amount-cents.sql
+new file mode 100644
+index 0000000..f061cf8
+--- /dev/null
++++ b/scripts/backfill-orders-amount-cents.sql
+@@ -0,0 +1,3 @@
++-- Run after migration 002 and repeat until it reports UPDATE 0 (batches avoid long row locks).
++update orders set amount_cents = total_cents
++where id in (select id from orders where amount_cents is null limit 5000);
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..3a837ff 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -46,7 +46,7 @@ export function createApp() {
+ 
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+-      "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
++      "select id, status, amount_cents, created_at from orders where user_id = $1 order by id",
+       [res.locals.user.id],
+     );
+     res.json(rows);

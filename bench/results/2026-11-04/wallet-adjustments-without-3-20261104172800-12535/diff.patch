@@ -1,0 +1,162 @@
+diff --git a/migrations/002_wallet_adjustments.sql b/migrations/002_wallet_adjustments.sql
+new file mode 100644
+index 0000000..cd7e6f5
+--- /dev/null
++++ b/migrations/002_wallet_adjustments.sql
+@@ -0,0 +1,9 @@
++-- Manual store-credit corrections made by admins (POST /wallets/:userId/adjustments).
++create table wallet_adjustments (
++  id serial primary key,
++  user_id integer not null references users(id),
++  admin_id integer not null references users(id),
++  amount_cents integer not null, -- may be negative; the resulting balance is never below 0
++  reason text not null,
++  created_at timestamptz not null default now()
++);
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..33bb9b8 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -25,6 +25,11 @@ async function auth(req: Request, res: Response, next: NextFunction) {
+   next();
+ }
+ 
++function requireAdmin(_req: Request, res: Response, next: NextFunction) {
++  if (res.locals.user.role !== "admin") return sendError(res, 403, "forbidden", "Admins only");
++  next();
++}
++
+ export function createApp() {
+   const app = express();
+   app.use(express.json());
+@@ -52,6 +57,48 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  // Admin correction of a user's store credit. The wallet row is locked while the balance is checked,
++  // so concurrent adjustments can't overdraw it.
++  app.post("/wallets/:userId/adjustments", requireAdmin, async (req, res) => {
++    const userId = Number(req.params.userId);
++    const { amountCents, reason } = req.body ?? {};
++    if (!Number.isSafeInteger(userId) || userId <= 0) return sendError(res, 400, "invalid", "userId must be a positive integer");
++    if (!Number.isSafeInteger(amountCents) || amountCents === 0) {
++      return sendError(res, 400, "invalid", "amountCents must be a non-zero integer");
++    }
++    if (typeof reason !== "string" || reason.trim() === "") return sendError(res, 400, "invalid", "reason is required");
++
++    const client = await pool.connect();
++    try {
++      await client.query("begin");
++      const { rowCount } = await client.query("select 1 from users where id = $1", [userId]);
++      if (rowCount === 0) {
++        await client.query("rollback");
++        return sendError(res, 404, "not_found", "User not found");
++      }
++      await client.query("insert into wallets (user_id, balance_cents) values ($1, 0) on conflict (user_id) do nothing", [userId]);
++      const { rows } = await client.query("select balance_cents from wallets where user_id = $1 for update", [userId]);
++      const newBalance = rows[0].balance_cents + amountCents;
++      if (newBalance < 0) {
++        await client.query("rollback");
++        return sendError(res, 422, "insufficient_balance", "Adjustment would make the balance negative");
++      }
++      await client.query("update wallets set balance_cents = $2 where user_id = $1", [userId, newBalance]);
++      const { rows: [adjustment] } = await client.query(
++        `insert into wallet_adjustments (user_id, admin_id, amount_cents, reason) values ($1, $2, $3, $4)
++         returning id, user_id, admin_id, amount_cents, reason, created_at`,
++        [userId, res.locals.user.id, amountCents, reason],
++      );
++      await client.query("commit");
++      res.status(201).json({ ...adjustment, balance_cents: newBalance });
++    } catch (err) {
++      await client.query("rollback");
++      throw err;
++    } finally {
++      client.release();
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..4d6ab50 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,77 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const adjust = (token: string, userId: number | string, body: unknown) =>
++  fetch(`${base}/wallets/${userId}/adjustments`, {
++    method: "POST",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++const balance = async (userId: number) =>
++  (await pool.query("select balance_cents from wallets where user_id = $1", [userId])).rows[0].balance_cents;
++
++test("wallet adjustments are admin-only", async () => {
++  const res = await adjust("alice-token", 2, { amountCents: 100, reason: "nope" });
++  assert.equal(res.status, 403);
++  assert.deepEqual(await res.json(), { error: { code: "forbidden", message: "Admins only" } });
++  assert.equal(await balance(2), 500);
++});
++
++test("admin credit updates the balance and records the adjustment", async () => {
++  const res = await adjust("admin-token", 1, { amountCents: 1500, reason: "goodwill credit" });
++  assert.equal(res.status, 201);
++  const body = await res.json();
++  assert.equal(body.user_id, 1);
++  assert.equal(body.admin_id, 3);
++  assert.equal(body.amount_cents, 1500);
++  assert.equal(body.reason, "goodwill credit");
++  assert.equal(body.balance_cents, 11500);
++  assert.equal(await balance(1), 11500);
++  const { rows } = await pool.query("select user_id, admin_id, amount_cents, reason from wallet_adjustments");
++  assert.deepEqual(rows, [{ user_id: 1, admin_id: 3, amount_cents: 1500, reason: "goodwill credit" }]);
++});
++
++test("invalid adjustment bodies and user ids get 400 and change nothing", async () => {
++  const bad: [string, unknown][] = [
++    ["2", { amountCents: 0, reason: "x" }],
++    ["2", { amountCents: 1.5, reason: "x" }],
++    ["2", { amountCents: "100", reason: "x" }],
++    ["2", { amountCents: 100 }],
++    ["2", { amountCents: 100, reason: "   " }],
++    ["abc", { amountCents: 100, reason: "x" }],
++    ["1.5", { amountCents: 100, reason: "x" }],
++  ];
++  for (const [userId, body] of bad) {
++    const res = await adjust("admin-token", userId, body);
++    assert.equal(res.status, 400, JSON.stringify([userId, body]));
++  }
++  assert.equal(await balance(2), 500);
++});
++
++test("adjusting an unknown user gets 404", async () => {
++  const res = await adjust("admin-token", 9999, { amountCents: 100, reason: "x" });
++  assert.equal(res.status, 404);
++});
++
++test("an adjustment that would make the balance negative is rejected and not recorded", async () => {
++  const res = await adjust("admin-token", 2, { amountCents: -501, reason: "too much" });
++  assert.equal(res.status, 422);
++  assert.equal(await balance(2), 500);
++  const { rows } = await pool.query("select count(*)::int as n from wallet_adjustments where user_id = 2");
++  assert.equal(rows[0].n, 0);
++});
++
++test("a debit down to exactly zero is allowed", async () => {
++  const res = await adjust("admin-token", 2, { amountCents: -500, reason: "clawback" });
++  assert.equal(res.status, 201);
++  assert.equal(await balance(2), 0);
++});
++
++test("concurrent debits cannot overdraw the wallet", async () => {
++  // Alice has 11500: only one of three 6000 debits can succeed.
++  const results = await Promise.all([1, 2, 3].map(() => adjust("admin-token", 1, { amountCents: -6000, reason: "race" })));
++  assert.deepEqual(results.map((r) => r.status).sort(), [201, 422, 422]);
++  assert.equal(await balance(1), 5500);
++});

@@ -1,0 +1,11 @@
+diff --git a/migrations/002_orders_user_id_index.sql b/migrations/002_orders_user_id_index.sql
+new file mode 100644
+index 0000000..0e7d908
+--- /dev/null
++++ b/migrations/002_orders_user_id_index.sql
+@@ -0,0 +1,5 @@
++-- Index for GET /orders (where user_id = $1 order by id).
++-- CONCURRENTLY avoids blocking writes to the large orders table while it builds.
++-- It cannot run inside a transaction block, so this file must contain only this statement.
++-- If the build fails it leaves an INVALID index behind: drop it, then rerun `pnpm migrate`.
++create index concurrently if not exists orders_user_id_id_idx on orders (user_id, id);

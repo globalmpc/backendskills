@@ -1,0 +1,94 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..a11c58a 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { payments } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -52,6 +53,37 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  // Full refund of one of the caller's paid orders. The idempotency key is stable per order, so a retry
++  // after a timeout or a failed status update does not move money a second time.
++  app.post("/orders/:id/refund", async (req, res) => {
++    const id = Number(req.params.id);
++    if (!Number.isInteger(id)) return sendError(res, 404, "not_found", "Order not found");
++
++    const { rows } = await pool.query(
++      "select id, status, total_cents, payment_id from orders where id = $1 and user_id = $2",
++      [id, res.locals.user.id],
++    );
++    const order = rows[0];
++    if (!order) return sendError(res, 404, "not_found", "Order not found");
++    if (order.status !== "paid" || !order.payment_id) {
++      return sendError(res, 409, "not_refundable", "Only paid orders can be refunded");
++    }
++
++    await payments.refund({
++      paymentId: order.payment_id,
++      amountCents: order.total_cents,
++      idempotencyKey: `refund:order:${order.id}`,
++    });
++
++    // Conditional on status so a concurrent request that already marked the order refunded wins cleanly.
++    const { rows: updated } = await pool.query(
++      "update orders set status = 'refunded' where id = $1 and status = 'paid' returning id, status, total_cents, created_at",
++      [id],
++    );
++    if (updated.length === 0) return sendError(res, 409, "not_refundable", "Only paid orders can be refunded");
++    res.json(updated[0]);
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..9e06b46 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,40 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++test("POST /orders/:id/refund refunds a paid order in full and marks it refunded", async () => {
++  const res = await fetch(`${base}/orders/1/refund`, { method: "POST", headers: as("alice-token") });
++  assert.equal(res.status, 200);
++  const body = await res.json();
++  assert.equal(body.id, 1);
++  assert.equal(body.status, "refunded");
++  const { rows } = await pool.query("select kind, payment_id, amount_cents from payment_calls where kind = 'refund' and payment_id = 'pay_seed_1'");
++  assert.deepEqual(rows, [{ kind: "refund", payment_id: "pay_seed_1", amount_cents: 4000 }]);
++});
++
++test("POST /orders/:id/refund cannot refund an order twice", async () => {
++  const res = await fetch(`${base}/orders/1/refund`, { method: "POST", headers: as("alice-token") });
++  assert.equal(res.status, 409);
++  assert.deepEqual(await res.json(), { error: { code: "not_refundable", message: "Only paid orders can be refunded" } });
++  const { rows } = await pool.query("select count(*)::int as n from payment_calls where kind = 'refund' and payment_id = 'pay_seed_1'");
++  assert.equal(rows[0].n, 1);
++});
++
++test("POST /orders/:id/refund rejects pending orders", async () => {
++  const { rows } = await pool.query("insert into orders (user_id, status, total_cents) values (1, 'pending', 1200) returning id");
++  const res = await fetch(`${base}/orders/${rows[0].id}/refund`, { method: "POST", headers: as("alice-token") });
++  assert.equal(res.status, 409);
++  const { rows: status } = await pool.query("select status from orders where id = $1", [rows[0].id]);
++  assert.equal(status[0].status, "pending");
++});
++
++test("POST /orders/:id/refund returns 404 for other users', missing, and malformed ids", async () => {
++  const other = await fetch(`${base}/orders/3/refund`, { method: "POST", headers: as("alice-token") });
++  assert.equal(other.status, 404);
++  const missing = await fetch(`${base}/orders/999999/refund`, { method: "POST", headers: as("alice-token") });
++  assert.equal(missing.status, 404);
++  const malformed = await fetch(`${base}/orders/abc/refund`, { method: "POST", headers: as("alice-token") });
++  assert.equal(malformed.status, 404);
++  const { rows } = await pool.query("select status from orders where id = 3");
++  assert.equal(rows[0].status, "paid");
++});

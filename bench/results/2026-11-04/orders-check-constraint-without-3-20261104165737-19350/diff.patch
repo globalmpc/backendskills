@@ -1,0 +1,26 @@
+diff --git a/migrations/002_orders_total_nonnegative.sql b/migrations/002_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..05a62cf
+--- /dev/null
++++ b/migrations/002_orders_total_nonnegative.sql
+@@ -0,0 +1,9 @@
++-- Step 1 of 2: enforce the rule for new and updated rows without scanning existing ones.
++-- NOT VALID skips the table scan, so this only takes an ACCESS EXCLUSIVE lock briefly.
++-- lock_timeout makes the migration give up rather than queue behind long-running queries
++-- and block every read and write on orders while it waits. SET LOCAL lasts for this
++-- migration's implicit transaction only, so it does not leak into the shared pool.
++-- Step 2 is in 003, in a separate transaction, because VALIDATE CONSTRAINT scans the
++-- whole table and must not run while this step still holds ACCESS EXCLUSIVE.
++set local lock_timeout = '5s';
++alter table orders add constraint orders_total_cents_nonnegative check (total_cents >= 0) not valid;
+diff --git a/migrations/003_validate_orders_total_nonnegative.sql b/migrations/003_validate_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..7994de3
+--- /dev/null
++++ b/migrations/003_validate_orders_total_nonnegative.sql
+@@ -0,0 +1,5 @@
++-- Step 2 of 2 (see 002). VALIDATE CONSTRAINT scans the existing rows but takes only
++-- SHARE UPDATE EXCLUSIVE, so reads and writes on orders keep running during the scan.
++-- If any existing row violates the rule, this fails and the migration is not recorded.
++set local lock_timeout = '5s';
++alter table orders validate constraint orders_total_cents_nonnegative;

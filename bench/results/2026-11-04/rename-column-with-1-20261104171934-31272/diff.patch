@@ -1,0 +1,73 @@
+diff --git a/db/seed.sql b/db/seed.sql
+index 26e5d14..6d661c2 100644
+--- a/db/seed.sql
++++ b/db/seed.sql
+@@ -9,7 +9,7 @@ insert into products (name, price_cents, stock) values
+   ('Mug', 1200, 40),
+   ('Limited sneaker', 15000, 5);
+ 
+-insert into orders (user_id, status, total_cents, payment_id) values
++insert into orders (user_id, status, amount_cents, payment_id) values
+   (1, 'paid', 4000, 'pay_seed_1'),
+   (1, 'paid', 15000, 'pay_seed_2'),
+   (2, 'paid', 1200, 'pay_seed_3');
+diff --git a/migrations/002_orders_amount_cents.sql b/migrations/002_orders_amount_cents.sql
+new file mode 100644
+index 0000000..9548b90
+--- /dev/null
++++ b/migrations/002_orders_amount_cents.sql
+@@ -0,0 +1,31 @@
++-- Expand step of renaming orders.total_cents to orders.amount_cents.
++-- Both columns exist until every server runs code that reads amount_cents. A later migration
++-- (003) drops total_cents. Do not rename in one step: the previous version still reads total_cents.
++set lock_timeout = '5s';
++
++alter table orders add column amount_cents integer;
++
++-- Keeps the two columns equal for writes from either version of the app.
++create function orders_sync_amount_cents() returns trigger language plpgsql as $$
++begin
++  if tg_op = 'UPDATE' then
++    if new.total_cents is distinct from old.total_cents then new.amount_cents := new.total_cents; end if;
++    if new.amount_cents is distinct from old.amount_cents then new.total_cents := new.amount_cents; end if;
++  end if;
++  new.amount_cents := coalesce(new.amount_cents, new.total_cents);
++  new.total_cents := coalesce(new.total_cents, new.amount_cents);
++  return new;
++end $$;
++
++create trigger orders_sync_amount_cents before insert or update on orders
++  for each row execute function orders_sync_amount_cents();
++
++-- Backfill. Fine for the seed-sized database; on a large table, move this to a batched job first
++-- (see the db-migration skill, rule 4).
++update orders set amount_cents = total_cents where amount_cents is null;
++
++-- NOT NULL without a full-table scan under an exclusive lock: validate a CHECK first, then set NOT NULL.
++alter table orders add constraint orders_amount_cents_not_null check (amount_cents is not null) not valid;
++alter table orders validate constraint orders_amount_cents_not_null;
++alter table orders alter column amount_cents set not null;
++alter table orders drop constraint orders_amount_cents_not_null;
+diff --git a/migrations/down/002_orders_amount_cents.sql b/migrations/down/002_orders_amount_cents.sql
+new file mode 100644
+index 0000000..85da40c
+--- /dev/null
++++ b/migrations/down/002_orders_amount_cents.sql
+@@ -0,0 +1,4 @@
++-- Undoes migrations/002_orders_amount_cents.sql.
++drop trigger orders_sync_amount_cents on orders;
++drop function orders_sync_amount_cents();
++alter table orders drop column amount_cents;
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..228b27b 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -46,7 +46,7 @@ export function createApp() {
+ 
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+-      "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
++      "select id, status, amount_cents as total_cents, created_at from orders where user_id = $1 order by id",
+       [res.locals.user.id],
+     );
+     res.json(rows);

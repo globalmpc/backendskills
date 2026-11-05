@@ -1,0 +1,110 @@
+diff --git a/migrations/002_orders_user_created_idx.sql b/migrations/002_orders_user_created_idx.sql
+new file mode 100644
+index 0000000..c04d57e
+--- /dev/null
++++ b/migrations/002_orders_user_created_idx.sql
+@@ -0,0 +1,2 @@
++-- Serves GET /orders: filter by user, newest first, keyset-paginated on (created_at, id).
++create index orders_user_created_idx on orders (user_id, created_at desc, id desc);
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..d08cee6 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -15,6 +15,25 @@ export function sendError(res: Response, status: number, code: string, message:
+   res.status(status).json({ error: { code, message } });
+ }
+ 
++const PAGE_SIZE = 20;
++
++// Cursors are opaque to clients. The timestamp is passed as Postgres text so microseconds survive the round trip.
++function encodeCursor(createdAt: string, id: number) {
++  return Buffer.from(JSON.stringify([createdAt, id])).toString("base64url");
++}
++
++function decodeCursor(cursor: string): { createdAt: string; id: number } | null {
++  try {
++    const parsed: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
++    if (Array.isArray(parsed) && typeof parsed[0] === "string" && Number.isSafeInteger(parsed[1])) {
++      return { createdAt: parsed[0], id: parsed[1] };
++    }
++  } catch {
++    // fall through: malformed cursor
++  }
++  return null;
++}
++
+ async function auth(req: Request, res: Response, next: NextFunction) {
+   const token = req.headers.authorization?.replace(/^Bearer /, "");
+   const { rows } = token
+@@ -44,12 +63,28 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
+-  app.get("/orders", async (_req, res) => {
++  app.get("/orders", async (req, res) => {
++    let after: { createdAt: string; id: number } | null = null;
++    if (req.query.cursor !== undefined) {
++      after = typeof req.query.cursor === "string" ? decodeCursor(req.query.cursor) : null;
++      if (!after) return sendError(res, 400, "invalid_cursor", "Invalid cursor");
++    }
++
++    // Keyset pagination on (created_at, id), newest first. Fetch one extra row to know whether a next page exists.
+     const { rows } = await pool.query(
+-      "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
+-      [res.locals.user.id],
++      `select id, status, total_cents, created_at, created_at::text as sort_key
++         from orders
++        where user_id = $1
++          and ($2::timestamptz is null or (created_at, id) < ($2::timestamptz, $3::int))
++        order by created_at desc, id desc
++        limit $4`,
++      [res.locals.user.id, after?.createdAt ?? null, after?.id ?? null, PAGE_SIZE + 1],
+     );
+-    res.json(rows);
++
++    const page = rows.slice(0, PAGE_SIZE);
++    const last = page.at(-1);
++    const nextCursor = rows.length > PAGE_SIZE && last ? encodeCursor(last.sort_key, last.id) : null;
++    res.json({ orders: page.map(({ sort_key: _sortKey, ...order }) => order), nextCursor });
+   });
+ 
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..35a66f2 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -46,8 +46,32 @@ test("/me returns the caller", async () => {
+ test("/orders lists only the caller's orders", async () => {
+   const alice = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
+   const bob = await (await fetch(`${base}/orders`, { headers: as("bob-token") })).json();
+-  assert.equal(alice.length, 2);
+-  assert.equal(bob.length, 1);
++  assert.equal(alice.orders.length, 2);
++  assert.equal(bob.orders.length, 1);
++  assert.equal(alice.nextCursor, null);
++});
++
++test("/orders paginates newest first, 20 per page, following nextCursor", async () => {
++  // Bob gets 25 more orders, so he has 26 in total: a full page of 20, then 6.
++  await pool.query(
++    "insert into orders (user_id, status, total_cents, created_at) select 2, 'paid', 100, now() - (g || ' minutes')::interval from generate_series(1, 25) g",
++  );
++  const all = (await pool.query("select id from orders where user_id = 2 order by created_at desc, id desc")).rows.map((r) => r.id);
++
++  const first = await (await fetch(`${base}/orders`, { headers: as("bob-token") })).json();
++  assert.equal(first.orders.length, 20);
++  assert.notEqual(first.nextCursor, null);
++  assert.deepEqual(first.orders.map((o: { id: number }) => o.id), all.slice(0, 20));
++
++  const second = await (await fetch(`${base}/orders?cursor=${encodeURIComponent(first.nextCursor)}`, { headers: as("bob-token") })).json();
++  assert.deepEqual(second.orders.map((o: { id: number }) => o.id), all.slice(20));
++  assert.equal(second.nextCursor, null);
++});
++
++test("/orders rejects a malformed cursor", async () => {
++  const res = await fetch(`${base}/orders?cursor=not-a-cursor`, { headers: as("alice-token") });
++  assert.equal(res.status, 400);
++  assert.equal((await res.json()).error.code, "invalid_cursor");
+ });
+ 
+ test("/products lists products with stock", async () => {

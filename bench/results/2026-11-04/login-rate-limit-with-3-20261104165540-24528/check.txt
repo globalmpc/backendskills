@@ -1,0 +1,13 @@
+✔ the right password returns the user's token (61.484833ms)
+✔ a wrong password and an unknown email get the same 401 (53.293666ms)
+✔ bad input gets a 4xx, not a server error (2.659041ms)
+✔ guessing a password one try at a time gets stopped (210.71775ms)
+✔ 50 guesses at once get stopped too (87.808667ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 547.703917

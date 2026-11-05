@@ -1,0 +1,14 @@
+diff --git a/migrations/002_orders_user_id_index.sql b/migrations/002_orders_user_id_index.sql
+new file mode 100644
+index 0000000..59de14b
+--- /dev/null
++++ b/migrations/002_orders_user_id_index.sql
+@@ -0,0 +1 @@
++create index concurrently if not exists orders_user_id_id_idx on orders (user_id, id)
+diff --git a/migrations/down/002_orders_user_id_index.sql b/migrations/down/002_orders_user_id_index.sql
+new file mode 100644
+index 0000000..7a58fde
+--- /dev/null
++++ b/migrations/down/002_orders_user_id_index.sql
+@@ -0,0 +1 @@
++drop index concurrently if exists orders_user_id_id_idx

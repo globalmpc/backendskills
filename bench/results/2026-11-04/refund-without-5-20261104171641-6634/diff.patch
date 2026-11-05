@@ -1,0 +1,153 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..6498d33 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { payments } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -52,6 +53,50 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  // Full refund through the provider. The order row is locked for the duration so two concurrent
++  // requests can't both refund it. The provider call uses a per-order idempotency key, so if the
++  // provider succeeds but our update fails, a retry does not move money a second time.
++  app.post("/orders/:id/refund", async (req, res) => {
++    const id = Number(req.params.id);
++    const notFound = () => sendError(res, 404, "not_found", "Order not found");
++    if (!Number.isInteger(id)) return notFound();
++
++    const client = await pool.connect();
++    try {
++      await client.query("begin");
++      const { rows } = await client.query(
++        "select id, status, total_cents, payment_id from orders where id = $1 and user_id = $2 for update",
++        [id, res.locals.user.id],
++      );
++      const order = rows[0];
++      if (!order) {
++        await client.query("rollback");
++        return notFound();
++      }
++      if (order.status !== "paid") {
++        await client.query("rollback");
++        return sendError(res, 409, "not_paid", "Only paid orders can be refunded");
++      }
++
++      await payments.refund({
++        paymentId: order.payment_id,
++        amountCents: order.total_cents,
++        idempotencyKey: `refund-order-${order.id}`,
++      });
++      const { rows: [updated] } = await client.query(
++        "update orders set status = 'refunded' where id = $1 returning id, status, total_cents, created_at",
++        [order.id],
++      );
++      await client.query("commit");
++      res.json(updated);
++    } catch (err) {
++      await client.query("rollback").catch(() => {});
++      throw err;
++    } finally {
++      client.release();
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/refund.test.ts b/test/refund.test.ts
+new file mode 100644
+index 0000000..76a7550
+--- /dev/null
++++ b/test/refund.test.ts
+@@ -0,0 +1,85 @@
++import { test, before, after } from "node:test";
++import assert from "node:assert/strict";
++import type { Server } from "node:http";
++import { resetDatabase } from "../src/migrate.ts";
++import { createApp } from "../src/app.ts";
++import { pool } from "../src/db.ts";
++
++// Separate file from app.test.ts: that file counts provider calls made in the last minute, and these tests add refunds.
++
++let server: Server;
++let base: string;
++
++before(async () => {
++  await resetDatabase();
++  server = createApp().listen(0);
++  const address = server.address();
++  if (address === null || typeof address === "string") throw new Error("no port");
++  base = `http://localhost:${address.port}`;
++});
++
++after(async () => {
++  server.close();
++  await pool.end();
++});
++
++const refund = (orderId: string, token: string) =>
++  fetch(`${base}/orders/${orderId}/refund`, { method: "POST", headers: { authorization: `Bearer ${token}` } });
++
++const orderStatus = async (id: number) =>
++  (await pool.query("select status from orders where id = $1", [id])).rows[0].status;
++
++const refundCalls = async (paymentId: string) =>
++  (await pool.query("select count(*)::int as n from payment_calls where kind = 'refund' and payment_id = $1", [paymentId])).rows[0].n;
++
++test("refund requires a token", async () => {
++  const res = await fetch(`${base}/orders/1/refund`, { method: "POST" });
++  assert.equal(res.status, 401);
++});
++
++test("refund of another user's order, or a non-numeric id, is 404", async () => {
++  const other = await refund("1", "bob-token"); // order 1 belongs to alice
++  assert.equal(other.status, 404);
++  assert.equal((await other.json()).error.code, "not_found");
++  assert.equal((await refund("abc", "alice-token")).status, 404);
++  assert.equal(await orderStatus(1), "paid");
++});
++
++test("refund of a pending order is 409 and does not call the provider", async () => {
++  const { rows } = await pool.query(
++    "insert into orders (user_id, status, total_cents) values (1, 'pending', 700) returning id",
++  );
++  const id = rows[0].id;
++  const res = await refund(String(id), "alice-token");
++  assert.equal(res.status, 409);
++  assert.deepEqual(await res.json(), { error: { code: "not_paid", message: "Only paid orders can be refunded" } });
++  assert.equal(await orderStatus(id), "pending");
++  assert.equal(await refundCalls("pay_seed_1"), 0);
++});
++
++test("refunding a paid order refunds the full total through the provider and marks it refunded", async () => {
++  const res = await refund("1", "alice-token");
++  assert.equal(res.status, 200);
++  const body = await res.json();
++  assert.equal(body.id, 1);
++  assert.equal(body.status, "refunded");
++  assert.equal(body.total_cents, 4000);
++  assert.equal(await orderStatus(1), "refunded");
++
++  const { rows } = await pool.query("select amount_cents from payment_calls where kind = 'refund' and payment_id = 'pay_seed_1'");
++  assert.deepEqual(rows, [{ amount_cents: 4000 }]);
++});
++
++test("a second refund of the same order is 409 and does not refund again", async () => {
++  const res = await refund("1", "alice-token");
++  assert.equal(res.status, 409);
++  assert.equal(await refundCalls("pay_seed_1"), 1);
++});
++
++test("concurrent refunds of one order move money once", async () => {
++  const results = await Promise.all([refund("2", "alice-token"), refund("2", "alice-token"), refund("2", "alice-token")]);
++  const statuses = results.map((r) => r.status).sort();
++  assert.deepEqual(statuses, [200, 409, 409]);
++  assert.equal(await refundCalls("pay_seed_2"), 1);
++  assert.equal(await orderStatus(2), "refunded");
++});

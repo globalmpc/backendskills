@@ -1,0 +1,128 @@
+diff --git a/migrations/002_product_discount.sql b/migrations/002_product_discount.sql
+new file mode 100644
+index 0000000..c3e9da6
+--- /dev/null
++++ b/migrations/002_product_discount.sql
+@@ -0,0 +1,4 @@
++set lock_timeout = '5s';
++alter table products add column discount_percent integer not null default 0;
++alter table products add constraint products_discount_percent_range
++  check (discount_percent between 0 and 100) not valid;
+diff --git a/migrations/003_product_discount_validate.sql b/migrations/003_product_discount_validate.sql
+new file mode 100644
+index 0000000..04a1471
+--- /dev/null
++++ b/migrations/003_product_discount_validate.sql
+@@ -0,0 +1 @@
++alter table products validate constraint products_discount_percent_range;
+diff --git a/migrations/down/002_product_discount.sql b/migrations/down/002_product_discount.sql
+new file mode 100644
+index 0000000..c63a355
+--- /dev/null
++++ b/migrations/down/002_product_discount.sql
+@@ -0,0 +1,2 @@
++alter table products drop constraint if exists products_discount_percent_range;
++alter table products drop column if exists discount_percent;
+diff --git a/migrations/down/003_product_discount_validate.sql b/migrations/down/003_product_discount_validate.sql
+new file mode 100644
+index 0000000..af010a1
+--- /dev/null
++++ b/migrations/down/003_product_discount_validate.sql
+@@ -0,0 +1,2 @@
++-- Validation has no reverse: the constraint stays until down/002 drops it.
++select 1;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..8cc4efd 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,16 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
++    {
++      "name": "Set product discount (admin)",
++      "request": {
++        "method": "PATCH",
++        "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "admin-token", "type": "string" }] },
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "body": { "mode": "raw", "raw": "{ \"discountPercent\": 25 }" },
++        "url": "{{baseUrl}}/products/1"
++      }
++    },
+     { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..fd1d518 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -40,10 +40,28 @@ export function createApp() {
+   });
+ 
+   app.get("/products", async (_req, res) => {
+-    const { rows } = await pool.query("select id, name, price_cents, stock from products order by id");
++    const { rows } = await pool.query("select id, name, price_cents, stock, discount_percent from products order by id");
+     res.json(rows);
+   });
+ 
++  app.patch("/products/:id", async (req, res) => {
++    if (res.locals.user.role !== "admin") return sendError(res, 403, "forbidden", "Admin only");
++    const id = Number(req.params.id);
++    if (!/^\d+$/.test(req.params.id) || id > 2147483647) {
++      return sendError(res, 400, "invalid_id", "Product id must be a positive integer");
++    }
++    const discount = req.body?.discountPercent;
++    if (!Number.isInteger(discount) || discount < 0 || discount > 100) {
++      return sendError(res, 400, "invalid_discount", "discountPercent must be a whole number from 0 to 100");
++    }
++    const { rows } = await pool.query(
++      "update products set discount_percent = $1 where id = $2 returning id, name, price_cents, stock, discount_percent",
++      [discount, id],
++    );
++    if (rows.length === 0) return sendError(res, 404, "not_found", "Product not found");
++    res.json(rows[0]);
++  });
++
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+       "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..0118a6a 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -56,6 +56,35 @@ test("/products lists products with stock", async () => {
+   assert.equal(products.find((p: { name: string }) => p.name === "Limited sneaker").stock, 5);
+ });
+ 
++const patchProduct = (id: string | number, token: string, body: unknown) =>
++  fetch(`${base}/products/${id}`, {
++    method: "PATCH",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("admin sets a product discount", async () => {
++  const res = await patchProduct(1, "admin-token", { discountPercent: 25 });
++  assert.equal(res.status, 200);
++  assert.equal((await res.json()).discount_percent, 25);
++  const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
++  assert.equal(products.find((p: { id: number }) => p.id === 1).discount_percent, 25);
++});
++
++test("non-admin cannot set a discount", async () => {
++  const res = await patchProduct(1, "alice-token", { discountPercent: 50 });
++  assert.equal(res.status, 403);
++  assert.equal((await res.json()).error.code, "forbidden");
++});
++
++test("discount rejects bad input and unknown products", async () => {
++  for (const body of [{}, { discountPercent: -1 }, { discountPercent: 101 }, { discountPercent: 10.5 }, { discountPercent: "10" }, { discountPercent: null }]) {
++    assert.equal((await patchProduct(1, "admin-token", body)).status, 400, JSON.stringify(body));
++  }
++  assert.equal((await patchProduct("abc", "admin-token", { discountPercent: 5 })).status, 400);
++  assert.equal((await patchProduct(99999, "admin-token", { discountPercent: 5 })).status, 404);
++});
++
+ test("payments client records every call; the same idempotency key is charged once", async () => {
+   const first = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });
+   const again = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });

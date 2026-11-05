@@ -1,0 +1,133 @@
+diff --git a/migrations/002_product_discount.sql b/migrations/002_product_discount.sql
+new file mode 100644
+index 0000000..71cbb0c
+--- /dev/null
++++ b/migrations/002_product_discount.sql
+@@ -0,0 +1,6 @@
++-- Additive only: the previous app version keeps running against this schema during a rolling deploy.
++set lock_timeout = '5s';
++
++alter table products
++  add column discount_percent integer not null default 0
++  check (discount_percent between 0 and 100);
+diff --git a/migrations/down/002_product_discount.sql b/migrations/down/002_product_discount.sql
+new file mode 100644
+index 0000000..b837665
+--- /dev/null
++++ b/migrations/down/002_product_discount.sql
+@@ -0,0 +1 @@
++alter table products drop column discount_percent;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..9d9ca67 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,16 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    {
++      "name": "Set product discount (admin)",
++      "request": {
++        "method": "PATCH",
++        "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "admin-token", "type": "string" }] },
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "url": "{{baseUrl}}/products/1",
++        "body": { "mode": "raw", "raw": "{\n  \"discountPercent\": 10\n}", "options": { "raw": { "language": "json" } } }
++      }
++    }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..5333e4a 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -40,10 +40,29 @@ export function createApp() {
+   });
+ 
+   app.get("/products", async (_req, res) => {
+-    const { rows } = await pool.query("select id, name, price_cents, stock from products order by id");
++    const { rows } = await pool.query("select id, name, price_cents, stock, discount_percent from products order by id");
+     res.json(rows);
+   });
+ 
++  app.patch("/products/:id", async (req, res) => {
++    if (res.locals.user.role !== "admin") return sendError(res, 403, "forbidden", "Admins only");
++
++    const id = Number(req.params.id);
++    if (!Number.isInteger(id) || id < 1) return sendError(res, 400, "invalid_id", "Product id must be a positive integer");
++
++    const discountPercent = req.body?.discountPercent;
++    if (!Number.isInteger(discountPercent) || discountPercent < 0 || discountPercent > 100) {
++      return sendError(res, 400, "invalid_discount_percent", "discountPercent must be a whole number from 0 to 100");
++    }
++
++    const { rows } = await pool.query(
++      "update products set discount_percent = $1 where id = $2 returning id, name, price_cents, stock, discount_percent",
++      [discountPercent, id],
++    );
++    if (rows.length === 0) return sendError(res, 404, "not_found", "Product not found");
++    res.json(rows[0]);
++  });
++
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+       "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..ee0227e 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,52 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const patchDiscount = (token: string, id: string | number, body: unknown) =>
++  fetch(`${base}/products/${id}`, {
++    method: "PATCH",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("products have a discount, 0 by default", async () => {
++  const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
++  assert.ok(products.every((p: { discount_percent: number }) => p.discount_percent === 0));
++});
++
++test("an admin can set a product's discount", async () => {
++  const res = await patchDiscount("admin-token", 2, { discountPercent: 25 });
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { id: 2, name: "Mug", price_cents: 1200, stock: 40, discount_percent: 25 });
++  const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
++  assert.equal(products.find((p: { id: number }) => p.id === 2).discount_percent, 25);
++});
++
++test("a non-admin cannot change a discount", async () => {
++  const res = await patchDiscount("alice-token", 2, { discountPercent: 90 });
++  assert.equal(res.status, 403);
++  assert.deepEqual(await res.json(), { error: { code: "forbidden", message: "Admins only" } });
++});
++
++test("a discount must be a whole number from 0 to 100", async () => {
++  for (const discountPercent of [-1, 101, 12.5, "10", null]) {
++    const res = await patchDiscount("admin-token", 2, { discountPercent });
++    assert.equal(res.status, 400, `discountPercent ${JSON.stringify(discountPercent)}`);
++    assert.equal((await res.json()).error.code, "invalid_discount_percent");
++  }
++  const res = await patchDiscount("admin-token", 2, {});
++  assert.equal(res.status, 400);
++});
++
++test("a discount of 0 and 100 are accepted", async () => {
++  assert.equal((await patchDiscount("admin-token", 2, { discountPercent: 0 })).status, 200);
++  assert.equal((await patchDiscount("admin-token", 2, { discountPercent: 100 })).status, 200);
++});
++
++test("patching an unknown or invalid product id", async () => {
++  const missing = await patchDiscount("admin-token", 9999, { discountPercent: 10 });
++  assert.equal(missing.status, 404);
++  const invalid = await patchDiscount("admin-token", "abc", { discountPercent: 10 });
++  assert.equal(invalid.status, 400);
++  assert.equal((await invalid.json()).error.code, "invalid_id");
++});

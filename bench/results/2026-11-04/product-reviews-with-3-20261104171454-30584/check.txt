@@ -1,0 +1,13 @@
+✔ a buyer reviews a product and it is listed (45.735583ms)
+✔ non-buyers, second reviews and ratings outside 1-5 are rejected (7.665958ms)
+✔ convention: the database itself refuses a rating outside 1-5 and a second review (11.813708ms)
+✔ convention: the new endpoints are in the Postman collection (0.721417ms)
+✔ convention: every migration has a down migration that exactly reverses it (80.000166ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 269.792375

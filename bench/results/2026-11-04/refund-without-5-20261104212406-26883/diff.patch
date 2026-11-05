@@ -1,0 +1,92 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..368fa55 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { payments } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -52,6 +53,39 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.post("/orders/:id/refund", async (req, res) => {
++    const id = Number(req.params.id);
++    if (!Number.isInteger(id)) return sendError(res, 404, "not_found", "Order not found");
++    const user = res.locals.user;
++
++    const { rows } = await pool.query("select id, user_id, status, total_cents, payment_id from orders where id = $1", [id]);
++    const order = rows[0];
++    // Don't reveal other users' orders.
++    if (!order || (order.user_id !== user.id && user.role !== "admin")) {
++      return sendError(res, 404, "not_found", "Order not found");
++    }
++    if (order.status !== "paid" || !order.payment_id) {
++      return sendError(res, 409, "not_refundable", `Only paid orders can be refunded (status: ${order.status})`);
++    }
++
++    // The idempotency key makes concurrent or retried requests (e.g. after a crash between the provider
++    // call and the update below) move the money at most once.
++    await payments.refund({
++      paymentId: order.payment_id,
++      amountCents: order.total_cents,
++      idempotencyKey: `refund-order-${order.id}`,
++    });
++
++    const updated = await pool.query(
++      "update orders set status = 'refunded' where id = $1 and status = 'paid' returning id, status, total_cents, created_at",
++      [id],
++    );
++    if (updated.rows.length === 0) {
++      return sendError(res, 409, "not_refundable", "Order was already refunded");
++    }
++    res.json(updated.rows[0]);
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..d7c2232 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,36 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const refundCount = async (paymentId: string) =>
++  (await pool.query("select count(*)::int as n from payment_calls where kind = 'refund' and payment_id = $1", [paymentId])).rows[0].n;
++
++test("refund: owner refunds a paid order in full; second attempt is rejected", async () => {
++  const res = await fetch(`${base}/orders/1/refund`, { method: "POST", headers: as("alice-token") });
++  assert.equal(res.status, 200);
++  assert.equal((await res.json()).status, "refunded");
++  const { rows } = await pool.query("select amount_cents from payment_calls where kind = 'refund' and payment_id = 'pay_seed_1'");
++  assert.deepEqual(rows, [{ amount_cents: 4000 }]);
++  const again = await fetch(`${base}/orders/1/refund`, { method: "POST", headers: as("alice-token") });
++  assert.equal(again.status, 409);
++  assert.equal(await refundCount("pay_seed_1"), 1);
++});
++
++test("refund: concurrent requests refund once", async () => {
++  const rs = await Promise.all([1, 2, 3].map(() => fetch(`${base}/orders/2/refund`, { method: "POST", headers: as("alice-token") })));
++  assert.deepEqual(rs.map((r) => r.status).sort(), [200, 409, 409]);
++  assert.equal(await refundCount("pay_seed_2"), 1);
++});
++
++test("refund: other users get 404, unknown orders 404, unpaid orders 409, admin allowed", async () => {
++  const other = await fetch(`${base}/orders/3/refund`, { method: "POST", headers: as("alice-token") });
++  assert.equal(other.status, 404);
++  const missing = await fetch(`${base}/orders/999/refund`, { method: "POST", headers: as("alice-token") });
++  assert.equal(missing.status, 404);
++  await pool.query("update orders set status = 'pending' where id = 3");
++  const pending = await fetch(`${base}/orders/3/refund`, { method: "POST", headers: as("bob-token") });
++  assert.equal(pending.status, 409);
++  await pool.query("update orders set status = 'paid' where id = 3");
++  const admin = await fetch(`${base}/orders/3/refund`, { method: "POST", headers: as("admin-token") });
++  assert.equal(admin.status, 200);
++});

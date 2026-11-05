@@ -1,0 +1,11 @@
+✔ orders now have amount_cents with the existing totals (13.641875ms)
+✔ the new version lists orders (16.691834ms)
+✔ the previous version still lists orders against the new schema (rolling deploy) (12.47325ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 245.376875

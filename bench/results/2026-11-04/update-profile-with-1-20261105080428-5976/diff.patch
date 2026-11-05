@@ -1,0 +1,144 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..f672413 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -11,6 +11,15 @@
+   "item": [
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
++    {
++      "name": "Update user profile",
++      "request": {
++        "method": "PATCH",
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "body": { "mode": "raw", "raw": "{\n  \"name\": \"Alice Smith\",\n  \"email\": \"alice.smith@example.com\"\n}" },
++        "url": "{{baseUrl}}/users/1"
++      }
++    },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+     { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
+   ]
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..f6e0ae5 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -39,6 +39,57 @@ export function createApp() {
+     res.json(res.locals.user);
+   });
+ 
++  app.patch("/users/:id", async (req, res) => {
++    const caller = res.locals.user;
++    if (!/^\d+$/.test(req.params.id) || Number(req.params.id) > 2147483647) {
++      return sendError(res, 400, "invalid_id", "User id must be a positive integer");
++    }
++    const id = Number(req.params.id);
++    // Only the user themselves or an admin; anyone else gets the same 404 as a missing user.
++    if (id !== caller.id && caller.role !== "admin") return sendError(res, 404, "not_found", "User not found");
++
++    const body = req.body;
++    if (body === null || typeof body !== "object" || Array.isArray(body)) {
++      return sendError(res, 400, "invalid_body", "Body must be a JSON object");
++    }
++    const unknown = Object.keys(body).filter((k) => k !== "name" && k !== "email");
++    if (unknown.length > 0) return sendError(res, 400, "invalid_body", `Cannot update: ${unknown.join(", ")}`);
++
++    let name: string | null = null;
++    let email: string | null = null;
++    if ("name" in body) {
++      if (typeof body.name !== "string" || body.name.trim() === "" || body.name.trim().length > 200) {
++        return sendError(res, 400, "invalid_name", "name must be a non-empty string up to 200 characters");
++      }
++      name = body.name.trim();
++    }
++    if ("email" in body) {
++      const value = typeof body.email === "string" ? body.email.trim().toLowerCase() : "";
++      if (value.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) {
++        return sendError(res, 400, "invalid_email", "email must be a valid email address");
++      }
++      email = value;
++    }
++    if (name === null && email === null) {
++      return sendError(res, 400, "invalid_body", "Provide name and/or email");
++    }
++
++    try {
++      const { rows } = await pool.query(
++        `update users set name = coalesce($1, name), email = coalesce($2, email)
++         where id = $3 returning id, email, name, role`,
++        [name, email, id],
++      );
++      if (rows.length === 0) return sendError(res, 404, "not_found", "User not found");
++      res.json(rows[0]);
++    } catch (err) {
++      if ((err as { code?: string }).code === "23505") {
++        return sendError(res, 409, "email_taken", "That email is already in use");
++      }
++      throw err;
++    }
++  });
++
+   app.get("/products", async (_req, res) => {
+     const { rows } = await pool.query("select id, name, price_cents, stock from products order by id");
+     res.json(rows);
+@@ -52,7 +103,9 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
+-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
++  app.use((err: Error & { status?: number }, _req: Request, res: Response, _next: NextFunction) => {
++    // Malformed JSON and similar body-parser errors are the client's fault.
++    if (err.status === 400) return sendError(res, 400, "invalid_body", "Malformed request body");
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+   });
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..1db353e 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -50,6 +50,46 @@ test("/orders lists only the caller's orders", async () => {
+   assert.equal(bob.length, 1);
+ });
+ 
++const patch = (id: string | number, token: string, body: unknown) =>
++  fetch(`${base}/users/${id}`, {
++    method: "PATCH",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("PATCH /users/:id updates own name and email", async () => {
++  const res = await patch(2, "bob-token", { name: " Bobby ", email: "Bobby@Example.com" });
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { id: 2, email: "bobby@example.com", name: "Bobby", role: "user" });
++});
++
++test("PATCH /users/:id on someone else's profile is 404 and changes nothing", async () => {
++  const res = await patch(1, "bob-token", { name: "Hacked" });
++  assert.equal(res.status, 404);
++  const me = await (await fetch(`${base}/me`, { headers: as("alice-token") })).json();
++  assert.equal(me.name, "Alice");
++});
++
++test("PATCH /users/:id rejects bad input with 400", async () => {
++  for (const body of [{}, { name: "" }, { name: 5 }, { email: "nope" }, { role: "admin" }, [], null]) {
++    const res = await patch(1, "alice-token", body);
++    assert.equal(res.status, 400, JSON.stringify(body));
++    assert.ok((await res.json()).error.code);
++  }
++  assert.equal((await patch("abc", "alice-token", { name: "x" })).status, 400);
++  const bad = await fetch(`${base}/users/1`, {
++    method: "PATCH",
++    headers: { ...as("alice-token"), "content-type": "application/json" },
++    body: "{oops",
++  });
++  assert.equal(bad.status, 400);
++});
++
++test("PATCH /users/:id returns 409 for an email already in use", async () => {
++  const res = await patch(1, "alice-token", { email: "admin@example.com" });
++  assert.equal(res.status, 409);
++});
++
+ test("/products lists products with stock", async () => {
+   const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
+   assert.equal(products.length, 3);

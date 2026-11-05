@@ -1,0 +1,52 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..13c463e 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -52,6 +52,23 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.get("/orders/:id", async (req, res) => {
++    const id = Number(req.params.id);
++    if (!Number.isInteger(id) || id < 1 || id > 2147483647) {
++      return sendError(res, 404, "not_found", "Order not found");
++    }
++    const { rows } = await pool.query(
++      "select id, status, total_cents, created_at from orders where id = $1 and user_id = $2",
++      [id, res.locals.user.id],
++    );
++    if (rows.length === 0) return sendError(res, 404, "not_found", "Order not found");
++    const { rows: items } = await pool.query(
++      "select product_id, quantity, price_cents from order_items where order_id = $1 order by product_id",
++      [id],
++    );
++    res.json({ ...rows[0], items });
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..1ee6474 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -50,6 +50,19 @@ test("/orders lists only the caller's orders", async () => {
+   assert.equal(bob.length, 1);
+ });
+ 
++test("/orders/:id returns the caller's order with items, 404 otherwise", async () => {
++  const list = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
++  const res = await fetch(`${base}/orders/${list[0].id}`, { headers: as("alice-token") });
++  assert.equal(res.status, 200);
++  const order = await res.json();
++  assert.equal(order.id, list[0].id);
++  assert.ok(Array.isArray(order.items));
++  const other = await fetch(`${base}/orders/${list[0].id}`, { headers: as("bob-token") });
++  assert.equal(other.status, 404);
++  const bad = await fetch(`${base}/orders/abc`, { headers: as("alice-token") });
++  assert.equal(bad.status, 404);
++});
++
+ test("/products lists products with stock", async () => {
+   const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
+   assert.equal(products.length, 3);

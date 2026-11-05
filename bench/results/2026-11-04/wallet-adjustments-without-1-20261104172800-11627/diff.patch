@@ -1,0 +1,215 @@
+diff --git a/migrations/002_wallet_adjustments.sql b/migrations/002_wallet_adjustments.sql
+new file mode 100644
+index 0000000..2bee47b
+--- /dev/null
++++ b/migrations/002_wallet_adjustments.sql
+@@ -0,0 +1,12 @@
++-- Admin corrections to store credit. One row per adjustment; wallets.balance_cents is the running total.
++create table wallet_adjustments (
++  id serial primary key,
++  user_id integer not null references users(id),
++  admin_id integer not null references users(id),
++  amount_cents integer not null, -- negative to deduct
++  reason text not null,
++  created_at timestamptz not null default now()
++);
++
++-- Defense in depth: the adjustment endpoint already refuses to overdraw, this makes the database refuse too.
++alter table wallets add constraint wallets_balance_nonnegative check (balance_cents >= 0);
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..d054650 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { adjustWallet } from "./wallets.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -25,6 +26,11 @@ async function auth(req: Request, res: Response, next: NextFunction) {
+   next();
+ }
+ 
++function requireAdmin(_req: Request, res: Response, next: NextFunction) {
++  if (res.locals.user.role !== "admin") return sendError(res, 403, "forbidden", "Admins only");
++  next();
++}
++
+ export function createApp() {
+   const app = express();
+   app.use(express.json());
+@@ -52,6 +58,28 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.post("/wallets/:userId/adjustments", requireAdmin, async (req, res) => {
++    const userId = Number(req.params.userId);
++    const { amountCents, reason } = req.body ?? {};
++    if (!Number.isSafeInteger(userId) || userId < 1) {
++      return sendError(res, 400, "invalid_user_id", "User id must be a positive integer");
++    }
++    // Must fit the integer columns in Postgres.
++    if (!Number.isInteger(amountCents) || amountCents === 0 || amountCents > 2147483647 || amountCents < -2147483648) {
++      return sendError(res, 400, "invalid_amount", "amountCents must be a non-zero integer");
++    }
++    if (typeof reason !== "string" || reason.trim() === "") {
++      return sendError(res, 400, "invalid_reason", "reason is required");
++    }
++
++    const result = await adjustWallet({ userId, adminId: res.locals.user.id, amountCents, reason });
++    if (result.status === "user_not_found") return sendError(res, 404, "not_found", "User not found");
++    if (result.status === "insufficient_balance") {
++      return sendError(res, 422, "insufficient_balance", "Adjustment would make the balance negative");
++    }
++    res.status(201).json(result.adjustment);
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/src/wallets.ts b/src/wallets.ts
+new file mode 100644
+index 0000000..6d5011b
+--- /dev/null
++++ b/src/wallets.ts
+@@ -0,0 +1,66 @@
++import type { PoolClient } from "pg";
++import { pool } from "./db.ts";
++
++export type Adjustment = {
++  user_id: number;
++  admin_id: number;
++  amount_cents: number;
++  reason: string;
++  created_at: Date;
++  balance_cents: number;
++};
++
++export type AdjustmentResult =
++  | { status: "ok"; adjustment: Adjustment }
++  | { status: "user_not_found" }
++  | { status: "insufficient_balance" };
++
++// Applies an admin correction to a user's store credit and records it, in one transaction.
++// The wallet row is locked while we read and write it, so concurrent adjustments can't both pass the
++// non-negative check against the same starting balance.
++export async function adjustWallet(args: {
++  userId: number;
++  adminId: number;
++  amountCents: number;
++  reason: string;
++}): Promise<AdjustmentResult> {
++  const client = await pool.connect();
++  try {
++    await client.query("begin");
++    const result = await applyAdjustment(client, args);
++    await client.query(result.status === "ok" ? "commit" : "rollback");
++    return result;
++  } catch (err) {
++    await client.query("rollback");
++    throw err;
++  } finally {
++    client.release();
++  }
++}
++
++async function applyAdjustment(
++  client: PoolClient,
++  { userId, adminId, amountCents, reason }: { userId: number; adminId: number; amountCents: number; reason: string },
++): Promise<AdjustmentResult> {
++  const { rows: users } = await client.query("select id from users where id = $1", [userId]);
++  if (users.length === 0) return { status: "user_not_found" };
++
++  // Wallets are created with the user, but make sure the row exists so it can be locked.
++  await client.query(
++    "insert into wallets (user_id, balance_cents) values ($1, 0) on conflict (user_id) do nothing",
++    [userId],
++  );
++  const { rows: wallets } = await client.query("select balance_cents from wallets where user_id = $1 for update", [userId]);
++
++  const balanceCents = wallets[0].balance_cents + amountCents;
++  if (balanceCents < 0) return { status: "insufficient_balance" };
++
++  await client.query("update wallets set balance_cents = $2 where user_id = $1", [userId, balanceCents]);
++  const { rows } = await client.query(
++    `insert into wallet_adjustments (user_id, admin_id, amount_cents, reason)
++     values ($1, $2, $3, $4)
++     returning user_id, admin_id, amount_cents, reason, created_at`,
++    [userId, adminId, amountCents, reason],
++  );
++  return { status: "ok", adjustment: { ...rows[0], balance_cents: balanceCents } };
++}
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..dbe3651 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,68 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const adjust = (token: string, userId: number | string, body: unknown) =>
++  fetch(`${base}/wallets/${userId}/adjustments`, {
++    method: "POST",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++const balance = async (userId: number) =>
++  (await pool.query("select balance_cents from wallets where user_id = $1", [userId])).rows[0].balance_cents;
++
++test("wallet adjustments are admin-only", async () => {
++  const res = await adjust("alice-token", 2, { amountCents: 100, reason: "nice try" });
++  assert.equal(res.status, 403);
++  assert.deepEqual(await res.json(), { error: { code: "forbidden", message: "Admins only" } });
++  assert.equal(await balance(2), 500);
++});
++
++test("admin credit and debit update the balance and are recorded", async () => {
++  const credit = await adjust("admin-token", 2, { amountCents: 300, reason: "goodwill" });
++  assert.equal(credit.status, 201);
++  const body = await credit.json();
++  assert.equal(body.balance_cents, 800);
++  assert.equal(body.user_id, 2);
++  assert.equal(body.admin_id, 3);
++  assert.equal(body.amount_cents, 300);
++  assert.equal(body.reason, "goodwill");
++
++  const debit = await adjust("admin-token", 2, { amountCents: -800, reason: "reversal" });
++  assert.equal(debit.status, 201);
++  assert.equal((await debit.json()).balance_cents, 0);
++  assert.equal(await balance(2), 0);
++
++  const { rows } = await pool.query("select amount_cents from wallet_adjustments where user_id = 2 order by id");
++  assert.deepEqual(rows, [{ amount_cents: 300 }, { amount_cents: -800 }]);
++});
++
++test("an adjustment that would take the balance below 0 is rejected and not recorded", async () => {
++  const res = await adjust("admin-token", 2, { amountCents: -1, reason: "too much" });
++  assert.equal(res.status, 422);
++  assert.equal((await res.json()).error.code, "insufficient_balance");
++  assert.equal(await balance(2), 0);
++  const { rows } = await pool.query("select count(*)::int as n from wallet_adjustments where user_id = 2");
++  assert.equal(rows[0].n, 2);
++});
++
++test("concurrent debits can't overdraw the wallet", async () => {
++  const results = await Promise.all([
++    adjust("admin-token", 1, { amountCents: -6000, reason: "race a" }),
++    adjust("admin-token", 1, { amountCents: -6000, reason: "race b" }),
++  ]);
++  assert.deepEqual(results.map((r) => r.status).sort(), [201, 422]);
++  assert.equal(await balance(1), 4000);
++});
++
++test("invalid adjustments get 400 and an unknown user gets 404", async () => {
++  assert.equal((await adjust("admin-token", 2, { amountCents: 0, reason: "nothing" })).status, 400);
++  assert.equal((await adjust("admin-token", 2, { amountCents: 1.5, reason: "fractional" })).status, 400);
++  assert.equal((await adjust("admin-token", 2, { amountCents: "100", reason: "string" })).status, 400);
++  assert.equal((await adjust("admin-token", 2, { amountCents: 100, reason: "   " })).status, 400);
++  assert.equal((await adjust("admin-token", 2, { amountCents: 100 })).status, 400);
++  assert.equal((await adjust("admin-token", "abc", { amountCents: 100, reason: "bad id" })).status, 400);
++  assert.equal((await adjust("admin-token", 999, { amountCents: 100, reason: "no such user" })).status, 404);
++  assert.equal((await pool.query("select count(*)::int as n from wallet_adjustments")).rows[0].n, 3);
++});

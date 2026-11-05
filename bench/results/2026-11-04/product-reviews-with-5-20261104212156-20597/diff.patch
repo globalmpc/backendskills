@@ -1,0 +1,125 @@
+diff --git a/migrations/002_reviews.sql b/migrations/002_reviews.sql
+new file mode 100644
+index 0000000..7b3fc78
+--- /dev/null
++++ b/migrations/002_reviews.sql
+@@ -0,0 +1,9 @@
++create table reviews (
++  id serial primary key,
++  product_id integer not null references products(id),
++  user_id integer not null references users(id),
++  rating integer not null check (rating between 1 and 5),
++  body text not null,
++  created_at timestamptz not null default now(),
++  unique (product_id, user_id)
++);
+diff --git a/migrations/down/002_reviews.sql b/migrations/down/002_reviews.sql
+new file mode 100644
+index 0000000..fce02b7
+--- /dev/null
++++ b/migrations/down/002_reviews.sql
+@@ -0,0 +1 @@
++drop table reviews;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..d877057 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,8 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "List product reviews", "request": { "method": "GET", "url": "{{baseUrl}}/products/1/reviews" } },
++    { "name": "Create product review", "request": { "method": "POST", "header": [{ "key": "Content-Type", "value": "application/json" }], "url": "{{baseUrl}}/products/1/reviews", "body": { "mode": "raw", "raw": "{ \"rating\": 5, \"body\": \"Great product\" }" } } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..3c81caf 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -44,6 +44,51 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.post("/products/:id/reviews", async (req, res) => {
++    if (!/^\d{1,9}$/.test(req.params.id)) return sendError(res, 404, "not_found", "Product not found");
++    const productId = Number(req.params.id);
++    const { rating, body } = req.body ?? {};
++    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
++      return sendError(res, 400, "invalid_request", "rating must be an integer from 1 to 5");
++    }
++    if (typeof body !== "string" || body.trim() === "" || body.length > 5000) {
++      return sendError(res, 400, "invalid_request", "body must be a non-empty string of at most 5000 characters");
++    }
++    const user = res.locals.user;
++    const { rows: product } = await pool.query("select 1 from products where id = $1", [productId]);
++    if (product.length === 0) return sendError(res, 404, "not_found", "Product not found");
++    const { rows: bought } = await pool.query(
++      `select 1 from orders o join order_items i on i.order_id = o.id
++       where o.user_id = $1 and i.product_id = $2 and o.status = 'paid' limit 1`,
++      [user.id, productId],
++    );
++    if (bought.length === 0) {
++      return sendError(res, 403, "not_purchased", "Only customers who bought this product can review it");
++    }
++    const { rows } = await pool.query(
++      `insert into reviews (product_id, user_id, rating, body) values ($1, $2, $3, $4)
++       on conflict (product_id, user_id) do nothing
++       returning id, product_id, user_id, rating, body, created_at`,
++      [productId, user.id, rating, body],
++    );
++    if (rows.length === 0) return sendError(res, 409, "already_reviewed", "You already reviewed this product");
++    res.status(201).json(rows[0]);
++  });
++
++  app.get("/products/:id/reviews", async (req, res) => {
++    if (!/^\d{1,9}$/.test(req.params.id)) return sendError(res, 404, "not_found", "Product not found");
++    const productId = Number(req.params.id);
++    const { rows: product } = await pool.query("select 1 from products where id = $1", [productId]);
++    if (product.length === 0) return sendError(res, 404, "not_found", "Product not found");
++    const { rows } = await pool.query(
++      `select r.id, r.product_id, r.user_id, u.name as user_name, r.rating, r.body, r.created_at
++       from reviews r join users u on u.id = r.user_id
++       where r.product_id = $1 order by r.created_at desc, r.id desc`,
++      [productId],
++    );
++    res.json(rows);
++  });
++
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+       "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..abab69f 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,28 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++test("reviews: buyer can review once, others cannot, bad input is 4xx", async () => {
++  const post = (token: string, id: number | string, body: unknown) =>
++    fetch(`${base}/products/${id}/reviews`, {
++      method: "POST",
++      headers: { ...as(token), "content-type": "application/json" },
++      body: JSON.stringify(body),
++    });
++  // Alice bought the T-shirt (1); Bob did not.
++  assert.equal((await post("bob-token", 1, { rating: 5, body: "nice" })).status, 403);
++  assert.equal((await post("alice-token", 1, { rating: 0, body: "x" })).status, 400);
++  assert.equal((await post("alice-token", 1, { rating: 4.5, body: "x" })).status, 400);
++  assert.equal((await post("alice-token", 1, { rating: 5, body: "" })).status, 400);
++  assert.equal((await post("alice-token", 999, { rating: 5, body: "x" })).status, 404);
++  assert.equal((await post("alice-token", "abc", { rating: 5, body: "x" })).status, 404);
++
++  const results = await Promise.all(Array.from({ length: 10 }, () => post("alice-token", 1, { rating: 5, body: "Great" })));
++  assert.equal(results.filter((r) => r.status === 201).length, 1);
++  assert.equal(results.filter((r) => r.status === 409).length, 9);
++
++  const list = await (await fetch(`${base}/products/1/reviews`, { headers: as("bob-token") })).json();
++  assert.equal(list.length, 1);
++  assert.equal(list[0].rating, 5);
++  assert.equal((await fetch(`${base}/products/999/reviews`, { headers: as("bob-token") })).status, 404);
++});

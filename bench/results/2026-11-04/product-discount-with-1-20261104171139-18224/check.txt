@@ -1,0 +1,13 @@
+✔ an admin sets a discount (41.287542ms)
+✔ other users can't, and a discount over 100 is rejected (4.91125ms)
+✔ convention: the database itself refuses a discount over 100 (8.291042ms)
+✔ convention: the new endpoint is in the Postman collection (0.49975ms)
+✔ convention: every migration has a down migration that exactly reverses it (76.283708ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 297.346167

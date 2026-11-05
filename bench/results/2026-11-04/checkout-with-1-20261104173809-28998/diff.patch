@@ -1,0 +1,215 @@
+diff --git a/migrations/002_products_stock_nonnegative.sql b/migrations/002_products_stock_nonnegative.sql
+new file mode 100644
+index 0000000..6ca5932
+--- /dev/null
++++ b/migrations/002_products_stock_nonnegative.sql
+@@ -0,0 +1,2 @@
++set lock_timeout = '5s';
++alter table products add constraint products_stock_nonnegative check (stock >= 0);
+diff --git a/migrations/down/002_products_stock_nonnegative.sql b/migrations/down/002_products_stock_nonnegative.sql
+new file mode 100644
+index 0000000..3199808
+--- /dev/null
++++ b/migrations/down/002_products_stock_nonnegative.sql
+@@ -0,0 +1 @@
++alter table products drop constraint products_stock_nonnegative;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..19afa3b 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,15 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    {
++      "name": "Place order",
++      "request": {
++        "method": "POST",
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "body": { "mode": "raw", "raw": "{\"items\": [{\"productId\": 1, \"quantity\": 2}]}" },
++        "url": "{{baseUrl}}/orders"
++      }
++    }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..0dd63f3 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { payments } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -52,6 +53,113 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.post("/orders", async (req, res) => {
++    // Validate the body and merge lines for the same product.
++    const items = req.body?.items;
++    if (!Array.isArray(items) || items.length === 0 || items.length > 100) {
++      return sendError(res, 400, "invalid_items", "items must be a non-empty array (max 100)");
++    }
++    const wanted = new Map<number, number>();
++    for (const item of items) {
++      const { productId, quantity } = item ?? {};
++      if (!Number.isSafeInteger(productId) || productId < 1 || productId > 2_000_000_000) {
++        return sendError(res, 400, "invalid_product_id", "productId must be a positive integer");
++      }
++      if (!Number.isSafeInteger(quantity) || quantity < 1 || quantity > 1000) {
++        return sendError(res, 400, "invalid_quantity", "quantity must be an integer between 1 and 1000");
++      }
++      wanted.set(productId, (wanted.get(productId) ?? 0) + quantity);
++    }
++    const lines = [...wanted]
++      .map(([productId, quantity]) => ({ productId, quantity }))
++      .sort((a, b) => a.productId - b.productId);
++    if (lines.some((l) => l.quantity > 1000)) {
++      return sendError(res, 400, "invalid_quantity", "Total quantity per product must be at most 1000");
++    }
++
++    // Step 1 (short transaction): reserve stock and create a pending order. Each product is decremented with a
++    // conditional update, in product id order, so concurrent orders can't oversell or deadlock.
++    const client = await pool.connect();
++    let orderId: number;
++    let totalCents = 0;
++    const priced: { productId: number; quantity: number; priceCents: number }[] = [];
++    try {
++      await client.query("begin");
++      for (const line of lines) {
++        const { rows } = await client.query(
++          "update products set stock = stock - $2 where id = $1 and stock >= $2 returning price_cents",
++          [line.productId, line.quantity],
++        );
++        if (rows.length === 0) {
++          const { rowCount } = await client.query("select 1 from products where id = $1", [line.productId]);
++          await client.query("rollback");
++          return rowCount === 0
++            ? sendError(res, 404, "product_not_found", `Product ${line.productId} not found`)
++            : sendError(res, 409, "insufficient_stock", `Not enough stock for product ${line.productId}`);
++        }
++        priced.push({ ...line, priceCents: rows[0].price_cents });
++        totalCents += rows[0].price_cents * line.quantity;
++      }
++      if (totalCents > 2_000_000_000) {
++        await client.query("rollback");
++        return sendError(res, 400, "order_too_large", "Order total is too large");
++      }
++      const { rows } = await client.query(
++        "insert into orders (user_id, status, total_cents) values ($1, 'pending', $2) returning id",
++        [res.locals.user.id, totalCents],
++      );
++      orderId = rows[0].id;
++      for (const l of priced) {
++        await client.query(
++          "insert into order_items (order_id, product_id, quantity, price_cents) values ($1, $2, $3, $4)",
++          [orderId, l.productId, l.quantity, l.priceCents],
++        );
++      }
++      await client.query("commit");
++    } catch (err) {
++      await client.query("rollback").catch(() => {});
++      throw err;
++    } finally {
++      client.release();
++    }
++
++    // Step 2: charge outside any transaction. The key is derived from the order, so a retry can't charge twice.
++    let paymentId: string;
++    try {
++      ({ paymentId } = await payments.charge({ amountCents: totalCents, idempotencyKey: `order-${orderId}` }));
++    } catch (err) {
++      console.error(err);
++      // Release the reserved stock, but only if we are the ones moving the order out of 'pending'.
++      const c = await pool.connect();
++      try {
++        await c.query("begin");
++        const { rowCount } = await c.query("update orders set status = 'failed' where id = $1 and status = 'pending'", [orderId]);
++        if (rowCount === 1) {
++          for (const l of priced) {
++            await c.query("update products set stock = stock + $2 where id = $1", [l.productId, l.quantity]);
++          }
++        }
++        await c.query("commit");
++      } catch (e) {
++        await c.query("rollback").catch(() => {});
++        console.error(e);
++      } finally {
++        c.release();
++      }
++      return sendError(res, 502, "payment_failed", "Payment failed");
++    }
++
++    // Step 3: mark paid.
++    const { rows } = await pool.query(
++      "update orders set status = 'paid', payment_id = $2 where id = $1 and status = 'pending' returning id, status, total_cents, payment_id, created_at",
++      [orderId, paymentId],
++    );
++    res.status(201).json({
++      ...rows[0],
++      items: priced.map((l) => ({ productId: l.productId, quantity: l.quantity, priceCents: l.priceCents })),
++    });
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..23d1752 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,49 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const post = (token: string, body: unknown) =>
++  fetch(`${base}/orders`, {
++    method: "POST",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("POST /orders places an order, merges duplicate lines, reduces stock, charges once", async () => {
++  const res = await post("alice-token", { items: [{ productId: 1, quantity: 1 }, { productId: 1, quantity: 2 }] });
++  assert.equal(res.status, 201);
++  const order = await res.json();
++  assert.equal(order.status, "paid");
++  assert.equal(order.total_cents, 6000);
++  assert.deepEqual(order.items, [{ productId: 1, quantity: 3, priceCents: 2000 }]);
++  assert.equal((await pool.query("select stock from products where id = 1")).rows[0].stock, 97);
++  const calls = await pool.query("select 1 from payment_calls where idempotency_key = $1", [`order-${order.id}`]);
++  assert.equal(calls.rowCount, 1);
++});
++
++test("POST /orders: bad input is 400, unknown product is 404", async () => {
++  const bad = [
++    {},
++    { items: [] },
++    { items: [{ productId: 1, quantity: 0 }] },
++    { items: [{ productId: 1, quantity: 1.5 }] },
++    { items: [{ productId: "x", quantity: 1 }] },
++  ];
++  for (const body of bad) assert.equal((await post("alice-token", body)).status, 400);
++  assert.equal((await post("alice-token", { items: [{ productId: 999, quantity: 1 }] })).status, 404);
++});
++
++test("POST /orders: 409 changes nothing; parallel orders never oversell", async () => {
++  const before = (await pool.query("select stock from products where id = 2")).rows[0].stock;
++  const res = await post("alice-token", { items: [{ productId: 2, quantity: 1 }, { productId: 3, quantity: 6 }] });
++  assert.equal(res.status, 409);
++  assert.equal((await pool.query("select stock from products where id = 2")).rows[0].stock, before);
++
++  const results = await Promise.all(
++    Array.from({ length: 12 }, () => post("bob-token", { items: [{ productId: 3, quantity: 1 }] })),
++  );
++  const statuses = results.map((r) => r.status);
++  assert.equal(statuses.filter((s) => s === 201).length, 5);
++  assert.equal(statuses.filter((s) => s === 409).length, 7);
++  assert.equal((await pool.query("select stock from products where id = 3")).rows[0].stock, 0);
++});

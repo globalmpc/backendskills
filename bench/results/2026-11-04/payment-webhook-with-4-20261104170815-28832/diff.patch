@@ -1,0 +1,251 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..cf1ebdf 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -6,12 +6,39 @@
+   "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }] },
+   "variable": [
+     { "key": "baseUrl", "value": "http://localhost:3000" },
+-    { "key": "token", "value": "alice-token" }
++    { "key": "token", "value": "alice-token" },
++    { "key": "webhookSecret", "value": "whsec_dev" }
+   ],
+   "item": [
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    {
++      "name": "Payment provider webhook",
++      "event": [
++        {
++          "listen": "prerequest",
++          "script": {
++            "type": "text/javascript",
++            "exec": [
++              "const raw = pm.request.body.raw;",
++              "const sig = CryptoJS.HmacSHA256(raw, pm.variables.get('webhookSecret')).toString(CryptoJS.enc.Hex);",
++              "pm.request.headers.upsert({ key: 'Provider-Signature', value: sig });"
++            ]
++          }
++        }
++      ],
++      "request": {
++        "method": "POST",
++        "auth": { "type": "noauth" },
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "body": {
++          "mode": "raw",
++          "raw": "{ \"id\": \"evt_123\", \"type\": \"charge.succeeded\", \"paymentId\": \"pay_123\", \"created\": 1762300000 }"
++        },
++        "url": "{{baseUrl}}/webhooks/payments"
++      }
++    }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..e4304b1 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,8 +1,31 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { verifyWebhookSignature } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
++type PaymentEvent = { id: string; type: "charge.succeeded" | "charge.failed" | "charge.refunded"; paymentId: string; created: number };
++
++// Target status per event, and the statuses it may move an order from. Anything else is a no-op, so a
++// duplicate or an older event never moves an order backwards (e.g. "paid" after "refunded").
++// charge.refunded is also accepted from "pending": if it arrives before charge.succeeded, the later
++// success event then finds the order already refunded and does nothing.
++const TRANSITIONS: Record<PaymentEvent["type"], { to: string; from: string[] }> = {
++  "charge.succeeded": { to: "paid", from: ["pending"] },
++  "charge.failed": { to: "failed", from: ["pending"] },
++  "charge.refunded": { to: "refunded", from: ["pending", "paid"] },
++};
++
++function parsePaymentEvent(value: unknown): PaymentEvent | null {
++  if (typeof value !== "object" || value === null) return null;
++  const e = value as Record<string, unknown>;
++  if (typeof e.id !== "string" || e.id === "") return null;
++  if (typeof e.type !== "string" || !Object.hasOwn(TRANSITIONS, e.type)) return null;
++  if (typeof e.paymentId !== "string" || e.paymentId === "") return null;
++  if (!Number.isInteger(e.created)) return null;
++  return { id: e.id, type: e.type as PaymentEvent["type"], paymentId: e.paymentId, created: e.created as number };
++}
++
+ declare global {
+   namespace Express {
+     interface Locals {
+@@ -27,6 +50,40 @@ async function auth(req: Request, res: Response, next: NextFunction) {
+ 
+ export function createApp() {
+   const app = express();
++
++  // Provider webhook. Registered before express.json() and auth: it is called by the provider, not a
++  // user, and the signature is computed over the raw bytes, so this route must not parse the body first.
++  app.post("/webhooks/payments", express.raw({ type: "*/*" }), async (req, res) => {
++    const raw = req.body;
++    if (!Buffer.isBuffer(raw) || !verifyWebhookSignature(raw, req.get("Provider-Signature"))) {
++      return sendError(res, 401, "invalid_signature", "Invalid signature");
++    }
++    let json: unknown;
++    try {
++      json = JSON.parse(raw.toString("utf8"));
++    } catch {
++      return sendError(res, 400, "invalid_json", "Body must be JSON");
++    }
++    const event = parsePaymentEvent(json);
++    if (!event) return sendError(res, 400, "invalid_event", "Invalid payment event");
++
++    const t = TRANSITIONS[event.type];
++    // One conditional UPDATE: the check and the write are the same statement, so concurrent or repeated
++    // deliveries cannot both apply the change.
++    const { rowCount } = await pool.query(
++      "update orders set status = $1 where payment_id = $2 and status = any($3)",
++      [t.to, event.paymentId, t.from],
++    );
++    if (rowCount && rowCount > 0) return res.json({ ok: true, applied: true });
++
++    // Nothing changed: either the order is already past this event (fine, acknowledge it) or we have no
++    // order with this payment yet. Return 404 in that case so the provider retries later, since
++    // charge.succeeded can arrive before the order is saved with its payment_id.
++    const { rows } = await pool.query("select 1 from orders where payment_id = $1 limit 1", [event.paymentId]);
++    if (rows.length === 0) return sendError(res, 404, "not_found", "No order for this payment");
++    res.json({ ok: true, applied: false });
++  });
++
+   app.use(express.json());
+ 
+   app.get("/health", (_req, res) => {
+diff --git a/src/payments.ts b/src/payments.ts
+index 6b11a31..7ad3221 100644
+--- a/src/payments.ts
++++ b/src/payments.ts
+@@ -1,4 +1,4 @@
+-import { randomUUID } from "node:crypto";
++import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+ import { pool } from "./db.ts";
+ 
+ // Client for the payment provider. In this sample app the provider is simulated: every call takes
+@@ -28,6 +28,13 @@ async function call(kind: "charge" | "refund", paymentId: string, amountCents: n
+ // hex HMAC-SHA256 of the raw request body, keyed with `webhookSecret`.
+ export const webhookSecret = process.env.PAYMENT_WEBHOOK_SECRET ?? "whsec_dev";
+ 
++export function verifyWebhookSignature(rawBody: Buffer, signature: string | undefined): boolean {
++  if (!signature) return false;
++  const expected = createHmac("sha256", webhookSecret).update(rawBody).digest();
++  const given = Buffer.from(signature, "hex");
++  return given.length === expected.length && timingSafeEqual(given, expected);
++}
++
+ export const payments = {
+   charge: (args: { amountCents: number; idempotencyKey?: string }) =>
+     call("charge", `pay_${randomUUID()}`, args.amountCents, args.idempotencyKey),
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..dcdcf0e 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -1,10 +1,11 @@
+ import { test, before, after } from "node:test";
+ import assert from "node:assert/strict";
++import { createHmac, randomUUID } from "node:crypto";
+ import type { Server } from "node:http";
+ import { resetDatabase } from "../src/migrate.ts";
+ import { createApp } from "../src/app.ts";
+ import { pool } from "../src/db.ts";
+-import { payments } from "../src/payments.ts";
++import { payments, webhookSecret } from "../src/payments.ts";
+ 
+ let server: Server;
+ let base: string;
+@@ -64,3 +65,86 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++// Webhooks
++
++async function newOrder(status: string) {
++  const paymentId = `pay_test_${randomUUID()}`;
++  await pool.query("insert into orders (user_id, status, total_cents, payment_id) values (2, $1, 100, $2)", [status, paymentId]);
++  return paymentId;
++}
++
++const statusOf = async (paymentId: string) =>
++  (await pool.query("select status from orders where payment_id = $1", [paymentId])).rows[0].status;
++
++// Sends the body exactly as serialised, signed over those bytes unless a signature is given.
++function sendWebhook(body: unknown, signature?: string) {
++  const raw = typeof body === "string" ? body : JSON.stringify(body);
++  const sig = signature ?? createHmac("sha256", webhookSecret).update(raw).digest("hex");
++  return fetch(`${base}/webhooks/payments`, {
++    method: "POST",
++    headers: { "content-type": "application/json", "provider-signature": sig },
++    body: raw,
++  });
++}
++
++const event = (type: string, paymentId: string) => ({ id: `evt_${randomUUID()}`, type, paymentId, created: 1762300000 });
++
++test("webhook with a wrong signature is rejected and changes nothing", async () => {
++  const paymentId = await newOrder("pending");
++  const res = await sendWebhook(event("charge.succeeded", paymentId), "00".repeat(32));
++  assert.equal(res.status, 401);
++  assert.equal(await statusOf(paymentId), "pending");
++});
++
++test("webhook with no signature is rejected", async () => {
++  const res = await fetch(`${base}/webhooks/payments`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
++  assert.equal(res.status, 401);
++});
++
++test("charge.succeeded marks a pending order paid", async () => {
++  const paymentId = await newOrder("pending");
++  assert.equal((await sendWebhook(event("charge.succeeded", paymentId))).status, 200);
++  assert.equal(await statusOf(paymentId), "paid");
++});
++
++test("charge.failed marks a pending order failed", async () => {
++  const paymentId = await newOrder("pending");
++  assert.equal((await sendWebhook(event("charge.failed", paymentId))).status, 200);
++  assert.equal(await statusOf(paymentId), "failed");
++});
++
++test("the same event delivered 10 times at once applies once and every delivery gets 200", async () => {
++  const paymentId = await newOrder("pending");
++  const e = event("charge.succeeded", paymentId);
++  const responses = await Promise.all(Array.from({ length: 10 }, () => sendWebhook(e)));
++  assert.deepEqual(responses.map((r) => r.status), Array(10).fill(200));
++  assert.equal(await statusOf(paymentId), "paid");
++});
++
++test("refund arriving before success is kept: a late charge.succeeded does not undo it", async () => {
++  const paymentId = await newOrder("pending");
++  assert.equal((await sendWebhook(event("charge.refunded", paymentId))).status, 200);
++  assert.equal((await sendWebhook(event("charge.succeeded", paymentId))).status, 200);
++  assert.equal(await statusOf(paymentId), "refunded");
++});
++
++test("charge.failed does not move a paid order", async () => {
++  const paymentId = await newOrder("paid");
++  assert.equal((await sendWebhook(event("charge.failed", paymentId))).status, 200);
++  assert.equal(await statusOf(paymentId), "paid");
++});
++
++test("webhook for an unknown payment gets 404 so the provider retries", async () => {
++  const res = await sendWebhook(event("charge.succeeded", `pay_unknown_${randomUUID()}`));
++  assert.equal(res.status, 404);
++});
++
++test("webhook with an invalid body gets 400 even when signed", async () => {
++  const paymentId = await newOrder("pending");
++  const bad = { ...event("charge.exploded", paymentId) };
++  assert.equal((await sendWebhook(bad)).status, 400);
++  assert.equal((await sendWebhook("not json")).status, 400);
++  assert.equal((await sendWebhook({ ...event("charge.succeeded", paymentId), created: "yesterday" })).status, 400);
++  assert.equal(await statusOf(paymentId), "pending");
++});

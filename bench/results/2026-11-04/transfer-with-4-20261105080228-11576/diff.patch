@@ -1,0 +1,216 @@
+diff --git a/migrations/002_transfers.sql b/migrations/002_transfers.sql
+new file mode 100644
+index 0000000..f9e9728
+--- /dev/null
++++ b/migrations/002_transfers.sql
+@@ -0,0 +1,23 @@
++set lock_timeout = '5s';
++
++-- Not valid first so existing rows are not scanned under lock; validated in 003.
++alter table wallets add constraint wallets_balance_non_negative check (balance_cents >= 0) not valid;
++
++-- Append-only ledger of store credit transfers between users.
++create table transfers (
++  id serial primary key,
++  from_user_id integer not null references users(id),
++  to_user_id integer not null references users(id),
++  amount_cents integer not null check (amount_cents > 0),
++  idempotency_key text,
++  created_at timestamptz not null default now(),
++  check (from_user_id <> to_user_id),
++  unique (from_user_id, idempotency_key)
++);
++
++create function transfers_append_only() returns trigger language plpgsql as $$
++begin
++  raise exception 'transfers is append-only';
++end $$;
++create trigger transfers_append_only before update or delete on transfers
++  for each row execute function transfers_append_only();
+diff --git a/migrations/003_validate_wallet_balance.sql b/migrations/003_validate_wallet_balance.sql
+new file mode 100644
+index 0000000..aa401ad
+--- /dev/null
++++ b/migrations/003_validate_wallet_balance.sql
+@@ -0,0 +1 @@
++alter table wallets validate constraint wallets_balance_non_negative;
+diff --git a/migrations/down/002_transfers.sql b/migrations/down/002_transfers.sql
+new file mode 100644
+index 0000000..45e674b
+--- /dev/null
++++ b/migrations/down/002_transfers.sql
+@@ -0,0 +1,4 @@
++drop trigger transfers_append_only on transfers;
++drop function transfers_append_only();
++drop table transfers;
++alter table wallets drop constraint wallets_balance_non_negative;
+diff --git a/migrations/down/003_validate_wallet_balance.sql b/migrations/down/003_validate_wallet_balance.sql
+new file mode 100644
+index 0000000..e53a7c1
+--- /dev/null
++++ b/migrations/down/003_validate_wallet_balance.sql
+@@ -0,0 +1,2 @@
++-- Validation cannot be undone on its own; the constraint itself is dropped by down/002.
++select 1;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..8a5f7a1 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,18 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    {
++      "name": "Transfer store credit",
++      "request": {
++        "method": "POST",
++        "header": [
++          { "key": "Content-Type", "value": "application/json" },
++          { "key": "Idempotency-Key", "value": "transfer-1", "description": "Optional; retries with the same key move money once" }
++        ],
++        "body": { "mode": "raw", "raw": "{\n  \"toUserId\": 2,\n  \"amountCents\": 500\n}" },
++        "url": "{{baseUrl}}/transfers"
++      }
++    }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..db1cf1c 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -52,6 +52,69 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.post("/transfers", async (req, res) => {
++    const { toUserId, amountCents } = req.body ?? {};
++    const fromUserId: number = res.locals.user.id;
++    if (!Number.isInteger(toUserId) || toUserId < 1 || toUserId > 2_147_483_647) {
++      return sendError(res, 400, "invalid_request", "toUserId must be a positive integer");
++    }
++    if (!Number.isInteger(amountCents) || amountCents < 1 || amountCents > 2_000_000_000) {
++      return sendError(res, 400, "invalid_request", "amountCents must be a positive integer");
++    }
++    if (toUserId === fromUserId) {
++      return sendError(res, 400, "invalid_request", "Cannot transfer to yourself");
++    }
++    const rawKey = req.headers["idempotency-key"];
++    const key = typeof rawKey === "string" && rawKey !== "" ? rawKey.slice(0, 200) : null;
++
++    const client = await pool.connect();
++    try {
++      await client.query("begin");
++      // Lock both wallets in id order so opposite transfers cannot deadlock.
++      const { rows: locked } = await client.query(
++        "select user_id, balance_cents from wallets where user_id = any($1) order by user_id for update",
++        [[fromUserId, toUserId]],
++      );
++      if (!locked.some((w) => w.user_id === toUserId)) {
++        await client.query("rollback");
++        return sendError(res, 404, "not_found", "User not found");
++      }
++      const sender = locked.find((w) => w.user_id === fromUserId);
++      if (!sender || sender.balance_cents < amountCents) {
++        await client.query("rollback");
++        return sendError(res, 409, "insufficient_funds", "Not enough store credit");
++      }
++      const { rows: [t] } = await client.query(
++        `insert into transfers (from_user_id, to_user_id, amount_cents, idempotency_key)
++         values ($1, $2, $3, $4) on conflict (from_user_id, idempotency_key) do nothing
++         returning id, created_at`,
++        [fromUserId, toUserId, amountCents, key],
++      );
++      if (!t) {
++        // Same key already used by this sender: a retry. Return the original, move nothing.
++        await client.query("rollback");
++        const { rows: [prev] } = await pool.query(
++          `select id, to_user_id, amount_cents, created_at from transfers
++           where from_user_id = $1 and idempotency_key = $2`,
++          [fromUserId, key],
++        );
++        if (prev.to_user_id !== toUserId || prev.amount_cents !== amountCents) {
++          return sendError(res, 409, "idempotency_conflict", "Idempotency-Key was used with a different request");
++        }
++        return res.status(200).json({ id: prev.id, toUserId, amountCents, createdAt: prev.created_at });
++      }
++      await client.query("update wallets set balance_cents = balance_cents - $2 where user_id = $1", [fromUserId, amountCents]);
++      await client.query("update wallets set balance_cents = balance_cents + $2 where user_id = $1", [toUserId, amountCents]);
++      await client.query("commit");
++      res.status(201).json({ id: t.id, toUserId, amountCents, createdAt: t.created_at });
++    } catch (err) {
++      await client.query("rollback").catch(() => {});
++      throw err;
++    } finally {
++      client.release();
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..e64fa54 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,59 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const transfer = (token: string, body: unknown, headers: Record<string, string> = {}) =>
++  fetch(`${base}/transfers`, {
++    method: "POST",
++    headers: { ...as(token), "content-type": "application/json", ...headers },
++    body: JSON.stringify(body),
++  });
++const balance = async (id: number) =>
++  (await pool.query("select balance_cents from wallets where user_id = $1", [id])).rows[0].balance_cents as number;
++
++test("POST /transfers moves credit", async () => {
++  const [a, b] = [await balance(1), await balance(2)];
++  const res = await transfer("alice-token", { toUserId: 2, amountCents: 300 });
++  assert.equal(res.status, 201);
++  assert.equal(await balance(1), a - 300);
++  assert.equal(await balance(2), b + 300);
++});
++
++test("POST /transfers rejects bad input and unknown users", async () => {
++  const bad = [{}, { toUserId: 2, amountCents: 0 }, { toUserId: 2, amountCents: -5 }, { toUserId: 2, amountCents: 1.5 },
++    { toUserId: "2", amountCents: 5 }, { toUserId: 1, amountCents: 5 }];
++  for (const body of bad) {
++    assert.equal((await transfer("alice-token", body)).status, 400, JSON.stringify(body));
++  }
++  assert.equal((await transfer("alice-token", { toUserId: 999, amountCents: 5 })).status, 404);
++  assert.equal((await transfer("nope", { toUserId: 2, amountCents: 5 })).status, 401);
++});
++
++test("POST /transfers cannot overspend, even in parallel", async () => {
++  const [a, b] = [await balance(1), await balance(2)];
++  const amount = Math.floor(a / 3) + 1; // only 2 of 5 can succeed
++  const results = await Promise.all(Array.from({ length: 5 }, () => transfer("alice-token", { toUserId: 2, amountCents: amount })));
++  const ok = results.filter((r) => r.status === 201).length;
++  assert.equal(ok, 2);
++  assert.ok(results.every((r) => r.status === 201 || r.status === 409));
++  assert.equal(await balance(1), a - ok * amount);
++  assert.equal(await balance(2), b + ok * amount);
++});
++
++test("POST /transfers in opposite directions does not deadlock and conserves money", async () => {
++  const total = (await balance(1)) + (await balance(2));
++  const results = await Promise.all(Array.from({ length: 20 }, (_, i) =>
++    i % 2 ? transfer("alice-token", { toUserId: 2, amountCents: 1 }) : transfer("bob-token", { toUserId: 1, amountCents: 1 })));
++  assert.ok(results.every((r) => r.status === 201));
++  assert.equal((await balance(1)) + (await balance(2)), total);
++});
++
++test("POST /transfers with the same Idempotency-Key moves money once", async () => {
++  const a = await balance(1);
++  const results = await Promise.all(Array.from({ length: 5 }, () =>
++    transfer("alice-token", { toUserId: 2, amountCents: 7 }, { "idempotency-key": "retry-1" })));
++  assert.ok(results.every((r) => r.status === 201 || r.status === 200));
++  assert.equal(await balance(1), a - 7);
++  const clash = await transfer("alice-token", { toUserId: 2, amountCents: 8 }, { "idempotency-key": "retry-1" });
++  assert.equal(clash.status, 409);
++});

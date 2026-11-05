@@ -1,0 +1,176 @@
+diff --git a/migrations/002_reviews.sql b/migrations/002_reviews.sql
+new file mode 100644
+index 0000000..dab35a9
+--- /dev/null
++++ b/migrations/002_reviews.sql
+@@ -0,0 +1,11 @@
++-- One review per user per product (enforced by the unique constraint); eligibility (the user bought
++-- the product) is checked in the app before insert.
++create table reviews (
++  id serial primary key,
++  product_id integer not null references products(id),
++  user_id integer not null references users(id),
++  rating integer not null check (rating between 1 and 5),
++  body text not null,
++  created_at timestamptz not null default now(),
++  unique (product_id, user_id)
++);
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..a6e052a 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -25,6 +25,17 @@ async function auth(req: Request, res: Response, next: NextFunction) {
+   next();
+ }
+ 
++// Returns the id as a valid int4 primary key, or null if it can't be one (so it never reaches Postgres as an out-of-range value).
++function parseId(raw: string): number | null {
++  const id = Number(raw);
++  return Number.isInteger(id) && id >= 1 && id <= 2147483647 ? id : null;
++}
++
++async function productExists(id: number): Promise<boolean> {
++  const { rows } = await pool.query("select 1 from products where id = $1", [id]);
++  return rows.length > 0;
++}
++
+ export function createApp() {
+   const app = express();
+   app.use(express.json());
+@@ -52,6 +63,55 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.get("/products/:id/reviews", async (req, res) => {
++    const productId = parseId(req.params.id);
++    if (productId === null || !(await productExists(productId))) {
++      return sendError(res, 404, "not_found", "Product not found");
++    }
++    const { rows } = await pool.query(
++      "select id, product_id, user_id, rating, body, created_at from reviews where product_id = $1 order by id",
++      [productId],
++    );
++    res.json(rows);
++  });
++
++  app.post("/products/:id/reviews", async (req, res) => {
++    const productId = parseId(req.params.id);
++    if (productId === null || !(await productExists(productId))) {
++      return sendError(res, 404, "not_found", "Product not found");
++    }
++
++    const { rating, body } = req.body ?? {};
++    if (!Number.isInteger(rating) || rating < 1 || rating > 5 || typeof body !== "string" || body.trim() === "") {
++      return sendError(res, 400, "invalid_input", "rating must be an integer from 1 to 5 and body must be a non-empty string");
++    }
++
++    // "Bought" means a paid order containing the product; refunded or pending orders don't qualify.
++    const { rows: purchases } = await pool.query(
++      `select 1 from orders o join order_items oi on oi.order_id = o.id
++       where o.user_id = $1 and oi.product_id = $2 and o.status = 'paid' limit 1`,
++      [res.locals.user.id, productId],
++    );
++    if (purchases.length === 0) {
++      return sendError(res, 403, "not_purchased", "You can only review products you have bought");
++    }
++
++    try {
++      const { rows } = await pool.query(
++        `insert into reviews (product_id, user_id, rating, body) values ($1, $2, $3, $4)
++         returning id, product_id, user_id, rating, body, created_at`,
++        [productId, res.locals.user.id, rating, body],
++      );
++      res.status(201).json(rows[0]);
++    } catch (err) {
++      // 23505 = unique_violation on (product_id, user_id): the user already reviewed this product.
++      if ((err as { code?: string }).code === "23505") {
++        return sendError(res, 409, "already_reviewed", "You have already reviewed this product");
++      }
++      throw err;
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..000fd96 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,76 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const json = (token: string, body: unknown) => ({
++  method: "POST",
++  headers: { ...as(token), "content-type": "application/json" },
++  body: JSON.stringify(body),
++});
++
++test("reviews: list is empty until someone reviews; unknown or malformed product ids get 404", async () => {
++  const empty = await fetch(`${base}/products/1/reviews`, { headers: as("alice-token") });
++  assert.equal(empty.status, 200);
++  assert.deepEqual(await empty.json(), []);
++
++  for (const id of ["999", "abc", "0", "99999999999"]) {
++    const res = await fetch(`${base}/products/${id}/reviews`, { headers: as("alice-token") });
++    assert.equal(res.status, 404, id);
++  }
++});
++
++test("reviews: only users with a paid order for the product can review it", async () => {
++  // Alice has not bought the Mug (product 2); Bob has not bought the T-shirt (product 1).
++  const alice = await fetch(`${base}/products/2/reviews`, json("alice-token", { rating: 5, body: "great" }));
++  assert.equal(alice.status, 403);
++  assert.equal((await alice.json()).error.code, "not_purchased");
++  const bob = await fetch(`${base}/products/1/reviews`, json("bob-token", { rating: 5, body: "great" }));
++  assert.equal(bob.status, 403);
++});
++
++test("reviews: invalid rating or body is rejected with 400", async () => {
++  const bad = [
++    { rating: 0, body: "x" },
++    { rating: 6, body: "x" },
++    { rating: 4.5, body: "x" },
++    { rating: "5", body: "x" },
++    { body: "x" },
++    { rating: 5, body: "" },
++    { rating: 5, body: "   " },
++    { rating: 5, body: 42 },
++  ];
++  for (const payload of bad) {
++    const res = await fetch(`${base}/products/1/reviews`, json("alice-token", payload));
++    assert.equal(res.status, 400, JSON.stringify(payload));
++    assert.equal((await res.json()).error.code, "invalid_input");
++  }
++});
++
++test("reviews: a buyer can review once; the review is listed; a second attempt gets 409", async () => {
++  const res = await fetch(`${base}/products/1/reviews`, json("alice-token", { rating: 4, body: "Fits well" }));
++  assert.equal(res.status, 201);
++  const review = await res.json();
++  assert.equal(review.product_id, 1);
++  assert.equal(review.user_id, 1);
++  assert.equal(review.rating, 4);
++  assert.equal(review.body, "Fits well");
++  assert.ok(review.created_at);
++
++  const again = await fetch(`${base}/products/1/reviews`, json("alice-token", { rating: 1, body: "changed my mind" }));
++  assert.equal(again.status, 409);
++  assert.equal((await again.json()).error.code, "already_reviewed");
++
++  const list = await (await fetch(`${base}/products/1/reviews`, { headers: as("bob-token") })).json();
++  assert.deepEqual(list.map((r: { body: string }) => r.body), ["Fits well"]);
++});
++
++test("reviews: a refunded order does not make the product reviewable", async () => {
++  await pool.query("update orders set status = 'refunded' where id = 3");
++  const res = await fetch(`${base}/products/2/reviews`, json("bob-token", { rating: 5, body: "great" }));
++  assert.equal(res.status, 403);
++});
++
++test("reviews: endpoints require a token", async () => {
++  const res = await fetch(`${base}/products/1/reviews`);
++  assert.equal(res.status, 401);
++});

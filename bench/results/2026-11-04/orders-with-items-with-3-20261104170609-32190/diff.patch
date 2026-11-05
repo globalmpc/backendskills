@@ -1,0 +1,56 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..62ddcb8 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -45,11 +45,26 @@ export function createApp() {
+   });
+ 
+   app.get("/orders", async (_req, res) => {
+-    const { rows } = await pool.query(
++    const { rows: orders } = await pool.query(
+       "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
+       [res.locals.user.id],
+     );
+-    res.json(rows);
++    // One query for all items of these orders (not one per order).
++    const { rows: items } = await pool.query(
++      `select oi.order_id, oi.product_id, p.name as product_name, oi.quantity, oi.price_cents
++       from order_items oi
++       join products p on p.id = oi.product_id
++       where oi.order_id = any($1::int[])
++       order by oi.order_id, oi.product_id`,
++      [orders.map((o) => o.id)],
++    );
++    const itemsByOrder = new Map<number, unknown[]>();
++    for (const { order_id, ...item } of items) {
++      const list = itemsByOrder.get(order_id) ?? [];
++      list.push(item);
++      itemsByOrder.set(order_id, list);
++    }
++    res.json(orders.map((o) => ({ ...o, items: itemsByOrder.get(o.id) ?? [] })));
+   });
+ 
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..c9271fb 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -50,6 +50,18 @@ test("/orders lists only the caller's orders", async () => {
+   assert.equal(bob.length, 1);
+ });
+ 
++test("/orders includes each order's items with product id, name, quantity and price", async () => {
++  const orders = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
++  const [first, second] = orders;
++  assert.deepEqual(first.items, [
++    { product_id: 1, product_name: "T-shirt", quantity: 2, price_cents: 2000 },
++  ]);
++  assert.deepEqual(second.items, [
++    { product_id: 3, product_name: "Limited sneaker", quantity: 1, price_cents: 15000 },
++  ]);
++  assert.equal(first.total_cents, 4000);
++});
++
+ test("/products lists products with stock", async () => {
+   const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
+   assert.equal(products.length, 3);

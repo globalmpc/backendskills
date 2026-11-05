@@ -1,0 +1,225 @@
+diff --git a/migrations/002_reviews.sql b/migrations/002_reviews.sql
+new file mode 100644
+index 0000000..6b899e6
+--- /dev/null
++++ b/migrations/002_reviews.sql
+@@ -0,0 +1,10 @@
++-- Product reviews. A user can review a product once; the unique constraint is what enforces it.
++create table reviews (
++  id serial primary key,
++  product_id integer not null references products(id),
++  user_id integer not null references users(id),
++  rating integer not null check (rating between 1 and 5),
++  body text not null,
++  created_at timestamptz not null default now(),
++  unique (product_id, user_id)
++);
+diff --git a/migrations/down/002_reviews.sql b/migrations/down/002_reviews.sql
+new file mode 100644
+index 0000000..fce02b7
+--- /dev/null
++++ b/migrations/down/002_reviews.sql
+@@ -0,0 +1 @@
++drop table reviews;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..ede0b9e 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,8 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "List product reviews", "request": { "method": "GET", "url": "{{baseUrl}}/products/1/reviews" } },
++    { "name": "Create product review", "request": { "method": "POST", "url": "{{baseUrl}}/products/1/reviews", "header": [{ "key": "Content-Type", "value": "application/json" }], "body": { "mode": "raw", "raw": "{ \"rating\": 5, \"body\": \"Great fit\" }" } } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..002a8d1 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -25,6 +25,15 @@ async function auth(req: Request, res: Response, next: NextFunction) {
+   next();
+ }
+ 
++const MAX_INT = 2147483647;
++
++// Path ids are serial integers. Anything else is a 400, and so is a value Postgres can't store.
++function parseId(raw: string): number | null {
++  if (!/^[1-9]\d*$/.test(raw)) return null;
++  const n = Number(raw);
++  return n <= MAX_INT ? n : null;
++}
++
+ export function createApp() {
+   const app = express();
+   app.use(express.json());
+@@ -52,6 +61,55 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.get("/products/:id/reviews", async (req, res) => {
++    const productId = parseId(req.params.id);
++    if (productId === null) return sendError(res, 400, "invalid_id", "Product id must be a positive integer");
++    const { rows: found } = await pool.query("select 1 from products where id = $1", [productId]);
++    if (found.length === 0) return sendError(res, 404, "not_found", "Product not found");
++    const { rows } = await pool.query(
++      "select id, user_id, rating, body, created_at from reviews where product_id = $1 order by created_at desc, id desc",
++      [productId],
++    );
++    res.json(rows);
++  });
++
++  app.post("/products/:id/reviews", async (req, res) => {
++    const productId = parseId(req.params.id);
++    if (productId === null) return sendError(res, 400, "invalid_id", "Product id must be a positive integer");
++
++    const { rating, body } = req.body ?? {};
++    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
++      return sendError(res, 400, "invalid_rating", "Rating must be an integer from 1 to 5");
++    }
++    if (typeof body !== "string" || body.trim() === "" || body.length > 5000) {
++      return sendError(res, 400, "invalid_body", "Body must be a non-empty string of at most 5000 characters");
++    }
++
++    const { rows: found } = await pool.query("select 1 from products where id = $1", [productId]);
++    if (found.length === 0) return sendError(res, 404, "not_found", "Product not found");
++
++    // The insert only happens if the caller has a paid order containing this product, and the unique
++    // (product_id, user_id) constraint makes a second review a no-op, so two parallel requests can't both succeed.
++    const { rows: inserted } = await pool.query(
++      `insert into reviews (product_id, user_id, rating, body)
++       select $1::integer, $2::integer, $3::integer, $4::text
++       where exists (
++         select 1 from orders o join order_items oi on oi.order_id = o.id
++         where o.user_id = $2::integer and o.status = 'paid' and oi.product_id = $1::integer)
++       on conflict (product_id, user_id) do nothing
++       returning id, user_id, rating, body, created_at`,
++      [productId, res.locals.user.id, rating, body],
++    );
++    if (inserted.length === 1) return res.status(201).json(inserted[0]);
++
++    const { rows: existing } = await pool.query(
++      "select 1 from reviews where product_id = $1 and user_id = $2",
++      [productId, res.locals.user.id],
++    );
++    if (existing.length > 0) return sendError(res, 409, "already_reviewed", "You have already reviewed this product");
++    return sendError(res, 403, "not_purchased", "You can only review products you have bought");
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/reviews.test.ts b/test/reviews.test.ts
+new file mode 100644
+index 0000000..6dba162
+--- /dev/null
++++ b/test/reviews.test.ts
+@@ -0,0 +1,106 @@
++import { test, before, after } from "node:test";
++import assert from "node:assert/strict";
++import type { Server } from "node:http";
++import { resetDatabase } from "../src/migrate.ts";
++import { createApp } from "../src/app.ts";
++import { pool } from "../src/db.ts";
++
++// Seed: alice has paid orders for products 1 and 3; bob has a paid order for product 2.
++let server: Server;
++let base: string;
++
++before(async () => {
++  await resetDatabase();
++  server = createApp().listen(0);
++  const address = server.address();
++  if (address === null || typeof address === "string") throw new Error("no port");
++  base = `http://localhost:${address.port}`;
++});
++
++after(async () => {
++  server.close();
++  await pool.end();
++});
++
++const as = (token: string) => ({ authorization: `Bearer ${token}`, "content-type": "application/json" });
++const post = (token: string, productId: string | number, body: unknown) =>
++  fetch(`${base}/products/${productId}/reviews`, { method: "POST", headers: as(token), body: JSON.stringify(body) });
++
++test("a buyer can review a bought product; the review is returned and listed", async () => {
++  const res = await post("alice-token", 1, { rating: 5, body: "Great fit" });
++  assert.equal(res.status, 201);
++  const created = await res.json();
++  assert.equal(created.user_id, 1);
++  assert.equal(created.rating, 5);
++  assert.equal(created.body, "Great fit");
++
++  const list = await (await fetch(`${base}/products/1/reviews`, { headers: as("bob-token") })).json();
++  assert.equal(list.length, 1);
++  assert.equal(list[0].body, "Great fit");
++});
++
++test("a second review of the same product by the same user is 409", async () => {
++  const res = await post("alice-token", 1, { rating: 1, body: "Changed my mind" });
++  assert.equal(res.status, 409);
++  assert.equal((await res.json()).error.code, "already_reviewed");
++});
++
++test("parallel reviews of the same product by one user: exactly one is stored", async () => {
++  const results = await Promise.all(
++    Array.from({ length: 10 }, () => post("alice-token", 3, { rating: 4, body: "Fast" })),
++  );
++  const statuses = results.map((r) => r.status).sort();
++  assert.deepEqual(statuses, [201, 409, 409, 409, 409, 409, 409, 409, 409, 409]);
++  const { rows } = await pool.query("select count(*)::int as n from reviews where product_id = 3 and user_id = 1");
++  assert.equal(rows[0].n, 1);
++});
++
++test("a user who never bought the product gets 403", async () => {
++  const res = await post("alice-token", 2, { rating: 3, body: "Never had one" });
++  assert.equal(res.status, 403);
++  assert.equal((await res.json()).error.code, "not_purchased");
++});
++
++test("an unpaid order does not count as a purchase", async () => {
++  await pool.query("insert into orders (user_id, status, total_cents) values (2, 'pending', 1200)");
++  const orderId = (await pool.query("select max(id) as id from orders")).rows[0].id;
++  await pool.query("insert into order_items (order_id, product_id, quantity, price_cents) values ($1, 1, 1, 2000)", [orderId]);
++  const res = await post("bob-token", 1, { rating: 3, body: "Not paid yet" });
++  assert.equal(res.status, 403);
++});
++
++test("reviewing a product that does not exist is 404", async () => {
++  const res = await post("alice-token", 9999, { rating: 5, body: "Hello" });
++  assert.equal(res.status, 404);
++  assert.equal((await res.json()).error.code, "not_found");
++});
++
++test("bad input is 400, never 500", async () => {
++  const cases: [string | number, unknown][] = [
++    [1, { rating: 0, body: "x" }],
++    [1, { rating: 6, body: "x" }],
++    [1, { rating: 4.5, body: "x" }],
++    [1, { rating: "5", body: "x" }],
++    [1, { rating: 5 }],
++    [1, { rating: 5, body: "   " }],
++    [1, { rating: 5, body: "x".repeat(5001) }],
++    ["abc", { rating: 5, body: "x" }],
++    ["0", { rating: 5, body: "x" }],
++    ["99999999999", { rating: 5, body: "x" }],
++  ];
++  for (const [productId, body] of cases) {
++    const res = await post("bob-token", productId, body);
++    assert.equal(res.status, 400, `expected 400 for ${productId} ${JSON.stringify(body).slice(0, 60)}`);
++    assert.equal(typeof (await res.json()).error.code, "string");
++  }
++});
++
++test("a request without a token gets 401", async () => {
++  const res = await fetch(`${base}/products/1/reviews`);
++  assert.equal(res.status, 401);
++});
++
++test("listing reviews of an unknown product is 404", async () => {
++  const res = await fetch(`${base}/products/9999/reviews`, { headers: as("bob-token") });
++  assert.equal(res.status, 404);
++});

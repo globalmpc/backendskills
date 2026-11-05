@@ -1,0 +1,90 @@
+diff --git a/db/seed.sql b/db/seed.sql
+index 26e5d14..6d661c2 100644
+--- a/db/seed.sql
++++ b/db/seed.sql
+@@ -9,7 +9,7 @@ insert into products (name, price_cents, stock) values
+   ('Mug', 1200, 40),
+   ('Limited sneaker', 15000, 5);
+ 
+-insert into orders (user_id, status, total_cents, payment_id) values
++insert into orders (user_id, status, amount_cents, payment_id) values
+   (1, 'paid', 4000, 'pay_seed_1'),
+   (1, 'paid', 15000, 'pay_seed_2'),
+   (2, 'paid', 1200, 'pay_seed_3');
+diff --git a/migrations/002_orders_amount_cents.sql b/migrations/002_orders_amount_cents.sql
+new file mode 100644
+index 0000000..3ba9668
+--- /dev/null
++++ b/migrations/002_orders_amount_cents.sql
+@@ -0,0 +1,25 @@
++-- Expand step of renaming orders.total_cents to orders.amount_cents. Old and new servers run side by side
++-- during a rolling deploy, so both columns stay equal (trigger below). The contract step, dropping
++-- total_cents, ships in a later migration, once no server reads it.
++set local lock_timeout = '5s';
++
++alter table orders add column amount_cents integer;
++
++-- Backfill. Fine while orders is small; if it can exceed ~100k rows, backfill in batches first.
++update orders set amount_cents = total_cents where amount_cents is null;
++
++create function orders_sync_amount_cents() returns trigger language plpgsql as $$
++begin
++  if tg_op = 'INSERT' then
++    new.amount_cents := coalesce(new.amount_cents, new.total_cents);
++    new.total_cents := coalesce(new.total_cents, new.amount_cents);
++  elsif new.amount_cents is distinct from old.amount_cents then
++    new.total_cents := new.amount_cents; -- written through the new name
++  else
++    new.amount_cents := new.total_cents; -- written through the old name
++  end if;
++  return new;
++end $$;
++
++create trigger orders_sync_amount_cents before insert or update on orders
++  for each row execute function orders_sync_amount_cents();
+diff --git a/migrations/down/002_orders_amount_cents.sql b/migrations/down/002_orders_amount_cents.sql
+new file mode 100644
+index 0000000..4e06110
+--- /dev/null
++++ b/migrations/down/002_orders_amount_cents.sql
+@@ -0,0 +1,4 @@
++-- Reverses migrations/002_orders_amount_cents.sql, in reverse order.
++drop trigger if exists orders_sync_amount_cents on orders;
++drop function if exists orders_sync_amount_cents();
++alter table orders drop column if exists amount_cents;
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..228b27b 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -46,7 +46,7 @@ export function createApp() {
+ 
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+-      "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
++      "select id, status, amount_cents as total_cents, created_at from orders where user_id = $1 order by id",
+       [res.locals.user.id],
+     );
+     res.json(rows);
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..d9f6278 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,18 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++test("orders.amount_cents and total_cents stay in sync whichever one is written", async () => {
++  const mismatched = await pool.query("select count(*)::int as n from orders where amount_cents is distinct from total_cents");
++  assert.equal(mismatched.rows[0].n, 0);
++
++  await pool.query("update orders set total_cents = 777 where id = 1");
++  assert.equal((await pool.query("select amount_cents from orders where id = 1")).rows[0].amount_cents, 777);
++
++  await pool.query("update orders set amount_cents = 888 where id = 1");
++  assert.equal((await pool.query("select total_cents from orders where id = 1")).rows[0].total_cents, 888);
++
++  await pool.query("insert into orders (user_id, status, amount_cents) values (1, 'pending', 350)");
++  const inserted = await pool.query("select total_cents from orders where amount_cents = 350");
++  assert.equal(inserted.rows[0].total_cents, 350);
++});

@@ -1,0 +1,96 @@
+diff --git a/migrations/002_product_discount.sql b/migrations/002_product_discount.sql
+new file mode 100644
+index 0000000..864a482
+--- /dev/null
++++ b/migrations/002_product_discount.sql
+@@ -0,0 +1,2 @@
++alter table products
++  add column discount_percent integer not null default 0 check (discount_percent between 0 and 100);
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..bb15356 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -44,6 +44,22 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.patch("/products/:id", async (req, res) => {
++    if (res.locals.user.role !== "admin") return sendError(res, 403, "forbidden", "Admins only");
++    const id = req.params.id;
++    const discount = req.body?.discountPercent;
++    if (!/^\d+$/.test(id) || Number(id) > 2147483647) return sendError(res, 404, "not_found", "Product not found");
++    if (!Number.isInteger(discount) || discount < 0 || discount > 100) {
++      return sendError(res, 400, "invalid_request", "discountPercent must be a whole number from 0 to 100");
++    }
++    const { rows } = await pool.query(
++      "update products set discount_percent = $1 where id = $2 returning id, name, price_cents, stock, discount_percent",
++      [discount, id],
++    );
++    if (rows.length === 0) return sendError(res, 404, "not_found", "Product not found");
++    res.json(rows[0]);
++  });
++
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+       "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..bbc4760 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -56,6 +56,56 @@ test("/products lists products with stock", async () => {
+   assert.equal(products.find((p: { name: string }) => p.name === "Limited sneaker").stock, 5);
+ });
+ 
++const patchDiscount = (token: string, id: number | string, body: unknown) =>
++  fetch(`${base}/products/${id}`, {
++    method: "PATCH",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("products default to no discount", async () => {
++  const { rows } = await pool.query("select discount_percent from products");
++  assert.ok(rows.every((r) => r.discount_percent === 0));
++});
++
++test("admins can set a product discount", async () => {
++  const res = await patchDiscount("admin-token", 3, { discountPercent: 25 });
++  assert.equal(res.status, 200);
++  assert.equal((await res.json()).discount_percent, 25);
++  const { rows } = await pool.query("select discount_percent from products where id = 3");
++  assert.equal(rows[0].discount_percent, 25);
++});
++
++test("non-admins cannot change a discount", async () => {
++  const res = await patchDiscount("alice-token", 3, { discountPercent: 50 });
++  assert.equal(res.status, 403);
++  const { rows } = await pool.query("select discount_percent from products where id = 3");
++  assert.equal(rows[0].discount_percent, 25);
++});
++
++test("discountPercent must be a whole number from 0 to 100", async () => {
++  for (const bad of [-1, 101, 10.5, "20", null, undefined]) {
++    const res = await patchDiscount("admin-token", 3, { discountPercent: bad });
++    assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(bad)}`);
++    assert.equal((await res.json()).error.code, "invalid_request");
++  }
++  const { rows } = await pool.query("select discount_percent from products where id = 3");
++  assert.equal(rows[0].discount_percent, 25);
++});
++
++test("discount can be set to the 0 and 100 bounds", async () => {
++  assert.equal((await patchDiscount("admin-token", 3, { discountPercent: 100 })).status, 200);
++  assert.equal((await patchDiscount("admin-token", 3, { discountPercent: 0 })).status, 200);
++});
++
++test("PATCH on an unknown product is 404", async () => {
++  for (const id of [9999, "abc", "99999999999"]) {
++    const res = await patchDiscount("admin-token", id, { discountPercent: 10 });
++    assert.equal(res.status, 404, `expected 404 for ${id}`);
++    assert.equal((await res.json()).error.code, "not_found");
++  }
++});
++
+ test("payments client records every call; the same idempotency key is charged once", async () => {
+   const first = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });
+   const again = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });

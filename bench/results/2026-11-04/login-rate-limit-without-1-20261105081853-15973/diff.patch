@@ -1,0 +1,95 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..0849feb 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -10,6 +10,16 @@
+   ],
+   "item": [
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
++    {
++      "name": "Login",
++      "request": {
++        "method": "POST",
++        "auth": { "type": "noauth" },
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "body": { "mode": "raw", "raw": "{ \"email\": \"alice@example.com\", \"password\": \"alice-password\" }" },
++        "url": "{{baseUrl}}/login"
++      }
++    },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+     { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..844f186 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,8 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { hashPassword, verifyPassword } from "./passwords.ts";
++
++const dummyHash = hashPassword("dummy-password-for-timing");
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -33,6 +36,22 @@ export function createApp() {
+     res.json({ ok: true });
+   });
+ 
++  // Public: this is how a client obtains its token.
++  app.post("/login", async (req, res) => {
++    const { email, password } = (req.body ?? {}) as { email?: unknown; password?: unknown };
++    if (typeof email !== "string" || typeof password !== "string" || email === "" || password === "") {
++      return sendError(res, 400, "invalid_request", "email and password are required strings");
++    }
++    const { rows } = await pool.query<{ api_token: string; password_hash: string }>(
++      "select api_token, password_hash from users where email = $1",
++      [email],
++    );
++    // Hash against a dummy when the user doesn't exist so timing doesn't reveal which emails are registered.
++    const ok = await verifyPassword(password, rows[0]?.password_hash ?? (await dummyHash));
++    if (rows.length === 0 || !ok) return sendError(res, 401, "invalid_credentials", "Invalid email or password");
++    res.json({ token: rows[0].api_token });
++  });
++
+   app.use(auth);
+ 
+   app.get("/me", (_req, res) => {
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..611300d 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -35,6 +35,33 @@ test("requests without a valid token get 401 in the standard error format", asyn
+   assert.deepEqual(await res.json(), { error: { code: "unauthorized", message: "Missing or invalid token" } });
+ });
+ 
++const login = (body: unknown) =>
++  fetch(`${base}/login`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
++
++test("/login returns the user's token without needing one", async () => {
++  const res = await login({ email: "alice@example.com", password: "alice-password" });
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { token: "alice-token" });
++});
++
++test("/login rejects a wrong password and an unknown email identically", async () => {
++  const expected = { error: { code: "invalid_credentials", message: "Invalid email or password" } };
++  const wrong = await login({ email: "alice@example.com", password: "bob-password" });
++  assert.equal(wrong.status, 401);
++  assert.deepEqual(await wrong.json(), expected);
++  const unknown = await login({ email: "nobody@example.com", password: "alice-password" });
++  assert.equal(unknown.status, 401);
++  assert.deepEqual(await unknown.json(), expected);
++});
++
++test("/login validates the body", async () => {
++  for (const body of [{}, { email: "alice@example.com" }, { email: 1, password: "x" }, null]) {
++    const res = await login(body);
++    assert.equal(res.status, 400);
++    assert.equal((await res.json()).error.code, "invalid_request");
++  }
++});
++
+ test("/me returns the caller", async () => {
+   const res = await fetch(`${base}/me`, { headers: as("alice-token") });
+   assert.equal(res.status, 200);

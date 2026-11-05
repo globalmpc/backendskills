@@ -1,0 +1,122 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..25f3cb6 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,7 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "Refund order", "request": { "method": "POST", "url": "{{baseUrl}}/orders/1/refund" } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..f7f0fcc 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { payments } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -52,6 +53,50 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.post("/orders/:id/refund", async (req, res) => {
++    const idParam = String(req.params.id);
++    const id = /^\d{1,9}$/.test(idParam) ? Number(idParam) : NaN;
++    if (!Number.isSafeInteger(id) || id < 1) return sendError(res, 400, "invalid_id", "Order id must be a positive integer");
++
++    const user = res.locals.user;
++    const isAdmin = user.role === "admin";
++    const load = async () => {
++      const { rows } = await pool.query(
++        "select id, status, total_cents, payment_id from orders where id = $1 and ($3 or user_id = $2)",
++        [id, user.id, isAdmin],
++      );
++      return rows[0] as { id: number; status: string; total_cents: number; payment_id: string | null } | undefined;
++    };
++
++    const order = await load();
++    if (!order) return sendError(res, 404, "not_found", "Order not found");
++    // A repeated request for an already refunded order is a no-op success.
++    if (order.status === "refunded") return res.json({ id: order.id, status: "refunded" });
++    if (order.status !== "paid" || !order.payment_id) {
++      return sendError(res, 409, "not_refundable", "Only paid orders can be refunded");
++    }
++
++    // The provider call is outside any transaction. The key is derived from the order, so concurrent or
++    // retried requests (including after a crash before the update below) refund once.
++    try {
++      await payments.refund({
++        paymentId: order.payment_id,
++        amountCents: order.total_cents,
++        idempotencyKey: `refund-order-${order.id}`,
++      });
++    } catch (err) {
++      console.error(err);
++      return sendError(res, 502, "refund_failed", "Refund failed");
++    }
++
++    const { rowCount } = await pool.query("update orders set status = 'refunded' where id = $1 and status = 'paid'", [order.id]);
++    if (rowCount === 0) {
++      const current = await load();
++      if (current?.status !== "refunded") return sendError(res, 409, "not_refundable", "Only paid orders can be refunded");
++    }
++    res.json({ id: order.id, status: "refunded" });
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..00a6fb4 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,42 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const refundCalls = async (paymentId: string) =>
++  (await pool.query("select count(*)::int as n from payment_calls where kind = 'refund' and payment_id = $1", [paymentId])).rows[0].n;
++const post = (path: string, token: string) => fetch(`${base}${path}`, { method: "POST", headers: as(token) });
++
++test("refund: someone else's order is 404 and untouched", async () => {
++  const res = await post("/orders/3/refund", "alice-token");
++  assert.equal(res.status, 404);
++  assert.equal((await pool.query("select status from orders where id = 3")).rows[0].status, "paid");
++});
++
++test("refund: bad ids are 400, unknown is 404", async () => {
++  for (const id of ["abc", "0", "-1", "1.5", "99999999999"]) {
++    assert.equal((await post(`/orders/${id}/refund`, "alice-token")).status, 400, id);
++  }
++  assert.equal((await post("/orders/9999/refund", "alice-token")).status, 404);
++});
++
++test("refund: parallel requests refund once and mark the order refunded", async () => {
++  const results = await Promise.all(Array.from({ length: 15 }, () => post("/orders/1/refund", "alice-token")));
++  for (const r of results) {
++    assert.equal(r.status, 200);
++    assert.equal((await r.json()).status, "refunded");
++  }
++  assert.equal((await pool.query("select status from orders where id = 1")).rows[0].status, "refunded");
++  assert.equal(await refundCalls("pay_seed_1"), 1);
++});
++
++test("refund: pending orders are rejected with 409 and no provider call", async () => {
++  const { rows } = await pool.query("insert into orders (user_id, status, total_cents) values (1, 'pending', 100) returning id");
++  const res = await post(`/orders/${rows[0].id}/refund`, "alice-token");
++  assert.equal(res.status, 409);
++  assert.equal((await res.json()).error.code, "not_refundable");
++});
++
++test("refund: admin can refund any order", async () => {
++  assert.equal((await post("/orders/3/refund", "admin-token")).status, 200);
++  assert.equal(await refundCalls("pay_seed_3"), 1);
++});

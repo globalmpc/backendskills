@@ -1,0 +1,120 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..4139ced 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { payments } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -52,6 +53,51 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  // Full refund of a paid order. The order row is locked for the whole refund so two concurrent requests
++  // cannot both refund it. The provider call uses a per-order idempotency key, so if the provider succeeds
++  // but our commit fails, a retry returns the same refund instead of refunding again.
++  app.post("/orders/:id/refund", async (req, res) => {
++    const { user } = res.locals;
++    const id = req.params.id;
++    if (!/^\d+$/.test(id)) return sendError(res, 404, "not_found", "Order not found");
++
++    const client = await pool.connect();
++    try {
++      await client.query("begin");
++      const { rows } = await client.query(
++        "select id, status, total_cents, payment_id, created_at from orders where id = $1 and ($2::boolean or user_id = $3) for update",
++        [id, user.role === "admin", user.id],
++      );
++      const order = rows[0];
++      if (!order) {
++        await client.query("rollback");
++        return sendError(res, 404, "not_found", "Order not found");
++      }
++      if (order.status !== "paid") {
++        await client.query("rollback");
++        return sendError(res, 409, "invalid_status", `Only paid orders can be refunded; this order is ${order.status}`);
++      }
++      if (!order.payment_id) throw new Error(`paid order ${order.id} has no payment_id`);
++
++      await payments.refund({
++        paymentId: order.payment_id,
++        amountCents: order.total_cents,
++        idempotencyKey: `refund:order:${order.id}`,
++      });
++      const { rows: [updated] } = await client.query(
++        "update orders set status = 'refunded' where id = $1 returning id, status, total_cents, created_at",
++        [order.id],
++      );
++      await client.query("commit");
++      res.json(updated);
++    } catch (err) {
++      await client.query("rollback").catch(() => {});
++      throw err;
++    } finally {
++      client.release();
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..7d4c6e3 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,52 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const refund = (orderId: number | string, token: string) =>
++  fetch(`${base}/orders/${orderId}/refund`, { method: "POST", headers: as(token) });
++
++test("refund: owner refunds a paid order in full, once", async () => {
++  const res = await refund(1, "alice-token");
++  assert.equal(res.status, 200);
++  const body = await res.json();
++  assert.equal(body.id, 1);
++  assert.equal(body.status, "refunded");
++  assert.equal(body.total_cents, 4000);
++  const { rows } = await pool.query("select payment_id, amount_cents from payment_calls where kind = 'refund' and idempotency_key = 'refund:order:1'");
++  assert.deepEqual(rows, [{ payment_id: "pay_seed_1", amount_cents: 4000 }]);
++
++  const again = await refund(1, "alice-token");
++  assert.equal(again.status, 409);
++  assert.equal((await again.json()).error.code, "invalid_status");
++});
++
++test("refund: only paid orders can be refunded", async () => {
++  const { rows: [pending] } = await pool.query("insert into orders (user_id, status, total_cents) values (1, 'pending', 1000) returning id");
++  const res = await refund(pending.id, "alice-token");
++  assert.equal(res.status, 409);
++  const { rows } = await pool.query("select status from orders where id = $1", [pending.id]);
++  assert.equal(rows[0].status, "pending");
++});
++
++test("refund: other users get 404, admins can refund any order", async () => {
++  assert.equal((await refund(3, "alice-token")).status, 404);
++  assert.equal((await refund(999, "alice-token")).status, 404);
++  assert.equal((await refund("abc", "alice-token")).status, 404);
++  const { rows } = await pool.query("select status from orders where id = 3");
++  assert.equal(rows[0].status, "paid");
++
++  assert.equal((await refund(3, "admin-token")).status, 200);
++});
++
++test("refund: requires a token", async () => {
++  const res = await fetch(`${base}/orders/2/refund`, { method: "POST" });
++  assert.equal(res.status, 401);
++});
++
++test("refund: concurrent requests refund the order once", async () => {
++  const { rows: [order] } = await pool.query("insert into orders (user_id, status, total_cents, payment_id) values (2, 'paid', 700, 'pay_race') returning id");
++  const results = await Promise.all([refund(order.id, "bob-token"), refund(order.id, "bob-token")]);
++  assert.deepEqual(results.map((r) => r.status).sort(), [200, 409]);
++  const { rows } = await pool.query("select count(*)::int as n from payment_calls where kind = 'refund' and payment_id = 'pay_race'");
++  assert.equal(rows[0].n, 1);
++});

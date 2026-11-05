@@ -1,0 +1,16 @@
+diff --git a/migrations/002_orders_user_id_idx.sql b/migrations/002_orders_user_id_idx.sql
+new file mode 100644
+index 0000000..0fc52cc
+--- /dev/null
++++ b/migrations/002_orders_user_id_idx.sql
+@@ -0,0 +1,3 @@
++-- Lookups like `where user_id = $1 order by id` (src/app.ts, GET /orders).
++-- Built concurrently so writes to the orders table are not blocked. Keep this statement alone in the file.
++create index concurrently if not exists orders_user_id_id_idx on orders (user_id, id);
+diff --git a/migrations/down/002_orders_user_id_idx.sql b/migrations/down/002_orders_user_id_idx.sql
+new file mode 100644
+index 0000000..08cb660
+--- /dev/null
++++ b/migrations/down/002_orders_user_id_idx.sql
+@@ -0,0 +1 @@
++drop index concurrently if exists orders_user_id_id_idx;

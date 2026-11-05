@@ -1,0 +1,105 @@
+diff --git a/migrations/002_webhooks.sql b/migrations/002_webhooks.sql
+new file mode 100644
+index 0000000..82f0d07
+--- /dev/null
++++ b/migrations/002_webhooks.sql
+@@ -0,0 +1,8 @@
++-- Payment provider webhook events already processed (dedupe on redelivery).
++create table webhook_events (
++  id text primary key,
++  received_at timestamptz not null default now()
++);
++
++-- Provider `created` timestamp of the last webhook applied to the order; older events are ignored.
++alter table orders add column last_event_at bigint;
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..1a8974d 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,10 +1,15 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
++import { createHmac, timingSafeEqual } from "node:crypto";
+ import { pool } from "./db.ts";
++import { webhookSecret } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+ declare global {
+   namespace Express {
++    interface Request {
++      rawBody?: Buffer;
++    }
+     interface Locals {
+       user: User;
+     }
+@@ -27,12 +32,69 @@ async function auth(req: Request, res: Response, next: NextFunction) {
+ 
+ export function createApp() {
+   const app = express();
+-  app.use(express.json());
++  app.use(
++    express.json({
++      verify: (req, _res, buf) => {
++        (req as Request).rawBody = buf;
++      },
++    }),
++  );
+ 
+   app.get("/health", (_req, res) => {
+     res.json({ ok: true });
+   });
+ 
++  const statusByType: Record<string, string> = {
++    "charge.succeeded": "paid",
++    "charge.failed": "failed",
++    "charge.refunded": "refunded",
++  };
++
++  // Called by the payment provider, so it is authenticated by signature instead of a bearer token.
++  app.post("/webhooks/payments", async (req, res) => {
++    const signature = req.get("provider-signature");
++    const expected = createHmac("sha256", webhookSecret).update(req.rawBody ?? Buffer.alloc(0)).digest();
++    const given = signature && /^[0-9a-f]{64}$/i.test(signature) ? Buffer.from(signature, "hex") : null;
++    if (!given || !timingSafeEqual(given, expected)) return sendError(res, 401, "invalid_signature", "Invalid signature");
++
++    const { id, type, paymentId, created } = req.body ?? {};
++    const status = typeof type === "string" ? statusByType[type] : undefined;
++    if (typeof id !== "string" || typeof paymentId !== "string" || !Number.isInteger(created) || !status) {
++      return sendError(res, 400, "invalid_event", "Invalid or unsupported event");
++    }
++
++    const client = await pool.connect();
++    try {
++      await client.query("begin");
++      const inserted = await client.query("insert into webhook_events (id) values ($1) on conflict do nothing", [id]);
++      if (inserted.rowCount === 0) {
++        await client.query("rollback");
++        return void res.json({ ok: true, duplicate: true });
++      }
++      // Events can arrive out of order: only apply one newer than the last applied to this order.
++      const updated = await client.query(
++        `update orders set status = $1, last_event_at = $2
++         where payment_id = $3 and (last_event_at is null or last_event_at < $2)`,
++        [status, created, paymentId],
++      );
++      if (updated.rowCount === 0) {
++        const exists = await client.query("select 1 from orders where payment_id = $1", [paymentId]);
++        if (exists.rowCount === 0) {
++          // Unknown order: roll back (event not recorded) so a provider retry can succeed later.
++          await client.query("rollback");
++          return sendError(res, 404, "not_found", "No order for this payment");
++        }
++      }
++      await client.query("commit");
++      res.json({ ok: true });
++    } catch (err) {
++      await client.query("rollback").catch(() => {});
++      throw err;
++    } finally {
++      client.release();
++    }
++  });
++
+   app.use(auth);
+ 
+   app.get("/me", (_req, res) => {

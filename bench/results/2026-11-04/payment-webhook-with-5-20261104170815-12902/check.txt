@@ -1,0 +1,11 @@
+✔ a signed charge.succeeded marks the order paid (19.670708ms)
+✔ an unsigned or wrongly signed webhook is rejected and changes nothing (3.718875ms)
+✔ a charge.succeeded that arrives after the refund doesn't undo the refund (4.671459ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 198.741291

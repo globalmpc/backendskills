@@ -1,0 +1,19 @@
+diff --git a/migrations/002_orders_total_nonnegative_add.sql b/migrations/002_orders_total_nonnegative_add.sql
+new file mode 100644
+index 0000000..56b561e
+--- /dev/null
++++ b/migrations/002_orders_total_nonnegative_add.sql
+@@ -0,0 +1,3 @@
++-- NOT VALID: enforced for new/updated rows immediately, but skips the full-table scan
++-- (which would hold an ACCESS EXCLUSIVE lock on the large orders table). Validated in 003.
++alter table orders add constraint orders_total_cents_nonnegative check (total_cents >= 0) not valid;
+diff --git a/migrations/003_orders_total_nonnegative_validate.sql b/migrations/003_orders_total_nonnegative_validate.sql
+new file mode 100644
+index 0000000..cafb599
+--- /dev/null
++++ b/migrations/003_orders_total_nonnegative_validate.sql
+@@ -0,0 +1,4 @@
++-- Separate file on purpose: each migration file runs as one transaction, and validating in the
++-- same transaction as the ADD would keep the ACCESS EXCLUSIVE lock for the whole scan.
++-- VALIDATE only takes SHARE UPDATE EXCLUSIVE, so reads and writes continue during the scan.
++alter table orders validate constraint orders_total_cents_nonnegative;

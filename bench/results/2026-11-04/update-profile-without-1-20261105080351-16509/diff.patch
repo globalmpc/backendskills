@@ -1,0 +1,75 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..afe3052 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -39,6 +39,41 @@ export function createApp() {
+     res.json(res.locals.user);
+   });
+ 
++  app.patch("/users/:id", async (req, res) => {
++    const caller = res.locals.user;
++    const id = Number(req.params.id);
++    if (!Number.isInteger(id) || id <= 0) return sendError(res, 404, "not_found", "User not found");
++    if (id !== caller.id && caller.role !== "admin") {
++      return sendError(res, 403, "forbidden", "You can only update your own profile");
++    }
++
++    const body = (req.body ?? {}) as Record<string, unknown>;
++    const name = typeof body.name === "string" ? body.name.trim() : undefined;
++    const email = typeof body.email === "string" ? body.email.trim().toLowerCase() : undefined;
++    if (body.name !== undefined && !name) return sendError(res, 400, "invalid_request", "name must be a non-empty string");
++    if (body.email !== undefined && (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) {
++      return sendError(res, 400, "invalid_request", "email must be a valid email address");
++    }
++    if (name === undefined && email === undefined) {
++      return sendError(res, 400, "invalid_request", "Provide name and/or email");
++    }
++
++    try {
++      const { rows } = await pool.query(
++        `update users set name = coalesce($1, name), email = coalesce($2, email)
++         where id = $3 returning id, email, name, role`,
++        [name ?? null, email ?? null, id],
++      );
++      if (rows.length === 0) return sendError(res, 404, "not_found", "User not found");
++      res.json(rows[0]);
++    } catch (err) {
++      if ((err as { code?: string }).code === "23505") {
++        return sendError(res, 409, "email_taken", "Email is already in use");
++      }
++      throw err;
++    }
++  });
++
+   app.get("/products", async (_req, res) => {
+     const { rows } = await pool.query("select id, name, price_cents, stock from products order by id");
+     res.json(rows);
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..7c7dd47 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -43,6 +43,24 @@ test("/me returns the caller", async () => {
+   assert.equal(me.api_token, undefined);
+ });
+ 
++test("PATCH /users/:id updates own profile, rejects others and bad input", async () => {
++  const patch = (id: number | string, token: string, body: unknown) =>
++    fetch(`${base}/users/${id}`, { method: "PATCH", headers: { ...as(token), "content-type": "application/json" }, body: JSON.stringify(body) });
++  const me = await (await fetch(`${base}/me`, { headers: as("alice-token") })).json();
++
++  const ok = await patch(me.id, "alice-token", { name: "Alice B" });
++  assert.equal(ok.status, 200);
++  const updated = await ok.json();
++  assert.equal(updated.name, "Alice B");
++  assert.equal(updated.email, "alice@example.com");
++  assert.equal(updated.api_token, undefined);
++
++  assert.equal((await patch(me.id + 1, "alice-token", { name: "x" })).status, 403);
++  assert.equal((await patch(me.id, "alice-token", {})).status, 400);
++  assert.equal((await patch(me.id, "alice-token", { email: "nope" })).status, 400);
++  assert.equal((await patch(me.id, "alice-token", { email: "bob@example.com" })).status, 409);
++});
++
+ test("/orders lists only the caller's orders", async () => {
+   const alice = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
+   const bob = await (await fetch(`${base}/orders`, { headers: as("bob-token") })).json();

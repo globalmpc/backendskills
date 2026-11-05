@@ -1,0 +1,11 @@
+✔ the database refuses an order with a negative total (25.720125ms)
+✔ the rule covers the existing orders too (the constraint is validated) (1.252375ms)
+✔ adding it doesn't block writes to the big table (NOT VALID, then VALIDATE in a separate migration) (0.604625ms)
+ℹ tests 3
+ℹ suites 0
+ℹ pass 3
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 150.8015

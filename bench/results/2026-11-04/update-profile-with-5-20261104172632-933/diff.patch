@@ -1,0 +1,186 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..d46d58d 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -6,12 +6,22 @@
+   "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }] },
+   "variable": [
+     { "key": "baseUrl", "value": "http://localhost:3000" },
+-    { "key": "token", "value": "alice-token" }
++    { "key": "token", "value": "alice-token" },
++    { "key": "userId", "value": "1" }
+   ],
+   "item": [
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    {
++      "name": "Update my profile",
++      "request": {
++        "method": "PATCH",
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "url": "{{baseUrl}}/users/{{userId}}",
++        "body": { "mode": "raw", "raw": "{\"name\": \"Alice\", \"email\": \"alice@example.com\"}", "options": { "raw": { "language": "json" } } }
++      }
++    }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..6070882 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -3,6 +3,8 @@ import { pool } from "./db.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
++const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
++
+ declare global {
+   namespace Express {
+     interface Locals {
+@@ -52,7 +54,52 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.patch("/users/:id", async (req, res) => {
++    const id = req.params.id;
++    if (!/^[1-9]\d{0,9}$/.test(id)) return sendError(res, 400, "invalid_id", "User id must be a positive integer");
++    // Only the caller may change their own profile; anyone else's id looks like a missing user.
++    if (Number(id) !== res.locals.user.id) return sendError(res, 404, "not_found", "User not found");
++
++    const body = req.body;
++    if (typeof body !== "object" || body === null || Array.isArray(body)) {
++      return sendError(res, 400, "invalid_body", "Body must be a JSON object");
++    }
++
++    // Only name and email are read from the body, so role and api_token can't be set here.
++    let name: string | null = null;
++    let email: string | null = null;
++    if (body.name !== undefined) {
++      const value = typeof body.name === "string" ? body.name.trim() : "";
++      if (value.length === 0 || value.length > 100) return sendError(res, 400, "invalid_name", "Name must be 1-100 characters");
++      name = value;
++    }
++    if (body.email !== undefined) {
++      const value = typeof body.email === "string" ? body.email.trim() : "";
++      if (value.length > 254 || !EMAIL_PATTERN.test(value)) return sendError(res, 400, "invalid_email", "Email is not valid");
++      email = value.toLowerCase();
++    }
++    if (name === null && email === null) return sendError(res, 400, "no_fields", "Send name and/or email");
++
++    try {
++      // One statement: the UNIQUE constraint on users.email decides between two concurrent requests.
++      const { rows } = await pool.query(
++        `update users set name = coalesce($1, name), email = coalesce($2, email)
++         where id = $3 returning id, email, name, role`,
++        [name, email, res.locals.user.id],
++      );
++      if (rows.length === 0) return sendError(res, 404, "not_found", "User not found");
++      res.json(rows[0]);
++    } catch (err) {
++      if ((err as { code?: string }).code === "23505") return sendError(res, 409, "email_taken", "Email is already in use");
++      throw err;
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
++    // Malformed JSON is the client's mistake: 400, not 500.
++    if ((err as { type?: string }).type === "entity.parse.failed") {
++      return sendError(res, 400, "invalid_json", "Body must be valid JSON");
++    }
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+   });
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..ab59ea3 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,86 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const patchUser = (id: string | number, token: string, body: unknown) =>
++  fetch(`${base}/users/${id}`, {
++    method: "PATCH",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++const storedUser = async (id: number) =>
++  (await pool.query("select email, name, role from users where id = $1", [id])).rows[0];
++
++test("PATCH /users/:id updates the caller's name and email and returns the profile", async () => {
++  const res = await patchUser(2, "bob-token", { name: "Robert", email: "  Robert@Example.com " });
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { id: 2, email: "robert@example.com", name: "Robert", role: "user" });
++  assert.deepEqual(await storedUser(2), { email: "robert@example.com", name: "Robert", role: "user" });
++
++  const restored = await patchUser(2, "bob-token", { name: "Bob", email: "bob@example.com" });
++  assert.equal(restored.status, 200);
++});
++
++test("PATCH /users/:id changes only the fields sent", async () => {
++  const res = await patchUser(2, "bob-token", { name: "Bobby" });
++  assert.equal(res.status, 200);
++  assert.equal((await res.json()).email, "bob@example.com");
++  await patchUser(2, "bob-token", { name: "Bob" });
++});
++
++test("PATCH /users/:id cannot change another user's profile (404, nothing changed)", async () => {
++  const res = await patchUser(2, "alice-token", { name: "Hacked" });
++  assert.equal(res.status, 404);
++  assert.deepEqual(await res.json(), { error: { code: "not_found", message: "User not found" } });
++  assert.equal((await storedUser(2)).name, "Bob");
++});
++
++test("PATCH /users/:id cannot set role or api_token", async () => {
++  const res = await patchUser(1, "alice-token", { name: "Alice", role: "admin", api_token: "x" });
++  assert.equal(res.status, 200);
++  assert.equal((await res.json()).role, "user");
++  assert.deepEqual(await storedUser(1), { email: "alice@example.com", name: "Alice", role: "user" });
++  const me = await fetch(`${base}/me`, { headers: as("alice-token") });
++  assert.equal(me.status, 200);
++});
++
++test("PATCH /users/:id returns 409 when the email belongs to someone else", async () => {
++  const res = await patchUser(1, "alice-token", { email: "bob@example.com" });
++  assert.equal(res.status, 409);
++  assert.deepEqual(await res.json(), { error: { code: "email_taken", message: "Email is already in use" } });
++  assert.equal((await storedUser(1)).email, "alice@example.com");
++});
++
++test("PATCH /users/:id rejects bad input with 400, never 500", async () => {
++  const cases: [string, unknown][] = [
++    ["abc", { name: "x" }],
++    ["0", { name: "x" }],
++    ["1", []],
++    ["1", "name"],
++    ["1", {}],
++    ["1", { name: "   " }],
++    ["1", { name: 42 }],
++    ["1", { name: "x".repeat(101) }],
++    ["1", { email: "not-an-email" }],
++    ["1", { email: 7 }],
++  ];
++  for (const [id, body] of cases) {
++    const res = await patchUser(id, "alice-token", body);
++    assert.equal(res.status, 400, `${id} ${JSON.stringify(body)}`);
++    assert.equal(typeof (await res.json()).error.code, "string");
++  }
++  assert.deepEqual(await storedUser(1), { email: "alice@example.com", name: "Alice", role: "user" });
++});
++
++test("PATCH /users/:id: two parallel requests for the same email yield one 200 and one 409", async () => {
++  const [a, b] = await Promise.all([
++    patchUser(1, "alice-token", { email: "race@example.com" }),
++    patchUser(2, "bob-token", { email: "race@example.com" }),
++  ]);
++  assert.deepEqual([a.status, b.status].sort(), [200, 409]);
++  await patchUser(1, "alice-token", { email: "alice@example.com" });
++  await patchUser(2, "bob-token", { email: "bob@example.com" });
++  assert.equal((await storedUser(1)).email, "alice@example.com");
++  assert.equal((await storedUser(2)).email, "bob@example.com");
++});

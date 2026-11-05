@@ -1,0 +1,40 @@
+✔ an order for an item in stock works (102.886042ms)
+✖ 20 buyers at once for 5 sneakers: 5 orders, 5 charges, stock never below 0 (60001.848375ms)
+✖ a negative quantity is rejected and nothing changes (60002.621459ms)
+✖ orders for the same two products in opposite order, at once, all go through (no deadlock) (60002.539875ms)
+✖ the same product twice in one order is handled, not a server error (60001.692167ms)
+
+Interrupted while running:
+
+⚠ hidden-check/check.test.ts (hidden-check/check.test.ts:1:1)
+✖ hidden-check/check.test.ts (299982.412084ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 1
+ℹ fail 0
+ℹ cancelled 5
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 299982.993458
+
+✖ failing tests:
+
+test at hidden-check/check.test.ts:1:963
+✖ 20 buyers at once for 5 sneakers: 5 orders, 5 charges, stock never below 0 (60001.848375ms)
+  'test timed out after 60000ms'
+
+test at hidden-check/check.test.ts:1:1379
+✖ a negative quantity is rejected and nothing changes (60002.621459ms)
+  'test timed out after 60000ms'
+
+test at hidden-check/check.test.ts:1:1654
+✖ orders for the same two products in opposite order, at once, all go through (no deadlock) (60002.539875ms)
+  'test timed out after 60000ms'
+
+test at hidden-check/check.test.ts:1:2158
+✖ the same product twice in one order is handled, not a server error (60001.692167ms)
+  'test timed out after 60000ms'
+
+test at hidden-check/check.test.ts:1:1
+✖ hidden-check/check.test.ts (299982.412084ms)
+  'Promise resolution is still pending but the event loop has already resolved'

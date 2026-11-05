@@ -1,0 +1,98 @@
+diff --git a/migrations/002_reviews.sql b/migrations/002_reviews.sql
+new file mode 100644
+index 0000000..13a190c
+--- /dev/null
++++ b/migrations/002_reviews.sql
+@@ -0,0 +1,8 @@
++create table reviews (
++  product_id integer not null references products(id),
++  user_id integer not null references users(id),
++  rating integer not null check (rating between 1 and 5),
++  body text not null,
++  created_at timestamptz not null default now(),
++  primary key (product_id, user_id)
++);
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..00c0b9b 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -52,6 +52,50 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.get("/products/:id/reviews", async (req, res) => {
++    const productId = Number(req.params.id);
++    if (!Number.isInteger(productId)) return sendError(res, 404, "not_found", "Product not found");
++    const product = await pool.query("select 1 from products where id = $1", [productId]);
++    if (product.rows.length === 0) return sendError(res, 404, "not_found", "Product not found");
++    const { rows } = await pool.query(
++      "select user_id, rating, body, created_at from reviews where product_id = $1 order by created_at, user_id",
++      [productId],
++    );
++    res.json(rows);
++  });
++
++  app.post("/products/:id/reviews", async (req, res) => {
++    const productId = Number(req.params.id);
++    if (!Number.isInteger(productId)) return sendError(res, 404, "not_found", "Product not found");
++    const { rating, body } = req.body ?? {};
++    if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
++      return sendError(res, 400, "invalid_request", "rating must be an integer from 1 to 5");
++    }
++    if (typeof body !== "string") return sendError(res, 400, "invalid_request", "body must be a string");
++
++    const product = await pool.query("select 1 from products where id = $1", [productId]);
++    if (product.rows.length === 0) return sendError(res, 404, "not_found", "Product not found");
++
++    const userId = res.locals.user.id;
++    const bought = await pool.query(
++      `select 1 from orders o join order_items i on i.order_id = o.id
++       where o.user_id = $1 and i.product_id = $2 and o.status = 'paid' limit 1`,
++      [userId, productId],
++    );
++    if (bought.rows.length === 0) {
++      return sendError(res, 403, "not_purchased", "You can only review products you have bought");
++    }
++
++    const { rows } = await pool.query(
++      `insert into reviews (product_id, user_id, rating, body) values ($1, $2, $3, $4)
++       on conflict (product_id, user_id) do nothing
++       returning user_id, rating, body, created_at`,
++      [productId, userId, rating, body],
++    );
++    if (rows.length === 0) return sendError(res, 409, "already_reviewed", "You have already reviewed this product");
++    res.status(201).json(rows[0]);
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..3f12678 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -56,6 +56,24 @@ test("/products lists products with stock", async () => {
+   assert.equal(products.find((p: { name: string }) => p.name === "Limited sneaker").stock, 5);
+ });
+ 
++test("reviews: only buyers, one per product, listed per product", async () => {
++  const post = (token: string, id: number, payload: unknown) =>
++    fetch(`${base}/products/${id}/reviews`, {
++      method: "POST",
++      headers: { ...as(token), "content-type": "application/json" },
++      body: JSON.stringify(payload),
++    });
++  assert.equal((await post("alice-token", 1, { rating: 6, body: "x" })).status, 400);
++  assert.equal((await post("alice-token", 1, { rating: 5 })).status, 400);
++  assert.equal((await post("bob-token", 1, { rating: 5, body: "x" })).status, 403);
++  assert.equal((await post("alice-token", 999, { rating: 5, body: "x" })).status, 404);
++  assert.equal((await post("alice-token", 1, { rating: 5, body: "Great" })).status, 201);
++  assert.equal((await post("alice-token", 1, { rating: 4, body: "Again" })).status, 409);
++  const list = await (await fetch(`${base}/products/1/reviews`, { headers: as("bob-token") })).json();
++  assert.equal(list.length, 1);
++  assert.equal(list[0].rating, 5);
++});
++
+ test("payments client records every call; the same idempotency key is charged once", async () => {
+   const first = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });
+   const again = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });

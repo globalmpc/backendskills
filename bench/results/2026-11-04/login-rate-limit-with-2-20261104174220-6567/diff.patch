@@ -1,0 +1,168 @@
+diff --git a/migrations/002_login_attempts.sql b/migrations/002_login_attempts.sql
+new file mode 100644
+index 0000000..dcd4239
+--- /dev/null
++++ b/migrations/002_login_attempts.sql
+@@ -0,0 +1,6 @@
++-- Shared counters for rate limiting (login). One row per key; the window restarts when `since` is old.
++create table login_attempts (
++  key text primary key,
++  n integer not null check (n >= 0),
++  since timestamptz not null default now()
++);
+diff --git a/migrations/down/002_login_attempts.sql b/migrations/down/002_login_attempts.sql
+new file mode 100644
+index 0000000..44e5305
+--- /dev/null
++++ b/migrations/down/002_login_attempts.sql
+@@ -0,0 +1 @@
++drop table login_attempts;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..3e79502 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -10,6 +10,16 @@
+   ],
+   "item": [
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
++    {
++      "name": "Login",
++      "request": {
++        "method": "POST",
++        "auth": { "type": "noauth" },
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "url": "{{baseUrl}}/login",
++        "body": { "mode": "raw", "raw": "{\n  \"email\": \"alice@example.com\",\n  \"password\": \"alice-password\"\n}" }
++      }
++    },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+     { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..c7df2bb 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { hashPassword, verifyPassword } from "./passwords.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -25,6 +26,27 @@ async function auth(req: Request, res: Response, next: NextFunction) {
+   next();
+ }
+ 
++const LOGIN_WINDOW = "15 minutes";
++const LOGIN_MAX_PER_EMAIL = 10;
++const LOGIN_MAX_PER_IP = 50;
++const MAX_PASSWORD_LENGTH = 1024;
++
++// Counts a try atomically (before any check) in the database, so parallel guesses can't slip under the limit.
++async function countAttempt(key: string): Promise<number> {
++  const { rows } = await pool.query(
++    `insert into login_attempts (key, n, since) values ($1, 1, now())
++     on conflict (key) do update set
++       n = case when login_attempts.since < now() - $2::interval then 1 else login_attempts.n + 1 end,
++       since = case when login_attempts.since < now() - $2::interval then now() else login_attempts.since end
++     returning n`,
++    [key, LOGIN_WINDOW],
++  );
++  return rows[0].n;
++}
++
++// Spends the same time on unknown emails as on wrong passwords.
++const dummyHash = hashPassword("dummy-password");
++
+ export function createApp() {
+   const app = express();
+   app.use(express.json());
+@@ -33,6 +55,34 @@ export function createApp() {
+     res.json({ ok: true });
+   });
+ 
++  app.post("/login", async (req, res) => {
++    const { email, password } = req.body ?? {};
++    if (typeof email !== "string" || typeof password !== "string" || email === "" || password === "") {
++      return sendError(res, 400, "invalid_request", "email and password are required strings");
++    }
++    if (password.length > MAX_PASSWORD_LENGTH || email.length > 320) {
++      return sendError(res, 400, "invalid_request", "email or password is too long");
++    }
++
++    const byEmail = await countAttempt(`login:${email.toLowerCase()}`);
++    const byIp = await countAttempt(`login-ip:${req.ip ?? "unknown"}`);
++    if (byEmail > LOGIN_MAX_PER_EMAIL || byIp > LOGIN_MAX_PER_IP) {
++      return sendError(res, 429, "too_many_attempts", "Too many attempts, try again later");
++    }
++
++    const { rows } = await pool.query("select api_token, password_hash from users where email = $1", [email]);
++    let ok = false;
++    try {
++      ok = await verifyPassword(password, rows[0]?.password_hash ?? (await dummyHash));
++    } catch {
++      ok = false;
++    }
++    if (!ok || rows.length === 0) {
++      return sendError(res, 401, "invalid_credentials", "Invalid email or password");
++    }
++    res.json({ token: rows[0].api_token });
++  });
++
+   app.use(auth);
+ 
+   app.get("/me", (_req, res) => {
+@@ -52,7 +102,9 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
+-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
++  app.use((err: Error & { status?: number; type?: string }, _req: Request, res: Response, _next: NextFunction) => {
++    if (err.type === "entity.parse.failed") return sendError(res, 400, "invalid_json", "Request body is not valid JSON");
++    if (err.type === "entity.too.large") return sendError(res, 413, "too_large", "Request body is too large");
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+   });
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..2a2d443 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,38 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const login = (body: unknown) =>
++  fetch(`${base}/login`, {
++    method: "POST",
++    headers: { "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("/login returns the token without auth", async () => {
++  const res = await login({ email: "alice@example.com", password: "alice-password" });
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { token: "alice-token" });
++});
++
++test("/login: wrong password and unknown email look the same", async () => {
++  const wrong = await login({ email: "bob@example.com", password: "nope" });
++  const unknown = await login({ email: "nobody@example.com", password: "nope" });
++  assert.equal(wrong.status, 401);
++  assert.equal(unknown.status, 401);
++  assert.deepEqual(await wrong.json(), await unknown.json());
++});
++
++test("/login: bad input is 400", async () => {
++  assert.equal((await login({ email: "a@b.c" })).status, 400);
++  assert.equal((await login({ email: 5, password: {} })).status, 400);
++  assert.equal((await login(null)).status, 400);
++});
++
++test("/login: locks out after too many tries, even with the right password", async () => {
++  await pool.query("delete from login_attempts");
++  for (let i = 0; i < 10; i++) await login({ email: "admin@example.com", password: "bad" });
++  const res = await login({ email: "admin@example.com", password: "admin-password" });
++  assert.equal(res.status, 429);
++  assert.equal((await res.json()).error.code, "too_many_attempts");
++});

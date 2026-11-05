@@ -1,0 +1,118 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..25f3cb6 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,7 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "Refund order", "request": { "method": "POST", "url": "{{baseUrl}}/orders/1/refund" } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..e80a661 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { payments } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -52,6 +53,45 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.post("/orders/:id/refund", async (req, res) => {
++    const id = Number(req.params.id);
++    if (!Number.isInteger(id) || id < 1) return sendError(res, 400, "invalid_id", "Order id must be a positive integer");
++
++    // Scoped to the caller: someone else's order looks the same as a missing one.
++    const { rows: [order] } = await pool.query(
++      "select id, status, total_cents, payment_id from orders where id = $1 and user_id = $2",
++      [id, res.locals.user.id],
++    );
++    if (!order) return sendError(res, 404, "not_found", "Order not found");
++    if (order.status !== "paid") return sendError(res, 409, "not_paid", "Only paid orders can be refunded");
++
++    // Outside any transaction. The key comes from the order, so a retry or a concurrent request
++    // gets the first refund back from the provider instead of refunding again.
++    try {
++      await payments.refund({
++        paymentId: order.payment_id,
++        amountCents: order.total_cents,
++        idempotencyKey: `refund-order-${order.id}`,
++      });
++    } catch (err) {
++      console.error(err);
++      return sendError(res, 502, "payment_failed", "Refund failed");
++    }
++
++    const { rows: [updated] } = await pool.query(
++      "update orders set status = 'refunded' where id = $1 and status = 'paid' returning id, status, total_cents, created_at",
++      [order.id],
++    );
++    if (updated) return res.json(updated);
++
++    // A concurrent request already marked it refunded. The provider call used the same key, so nothing moved twice.
++    const { rows: [current] } = await pool.query(
++      "select id, status, total_cents, created_at from orders where id = $1",
++      [order.id],
++    );
++    res.json(current);
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..8d35d9b 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,43 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const refund = (id: string, token: string) =>
++  fetch(`${base}/orders/${id}/refund`, { method: "POST", headers: as(token) });
++
++test("refund: a non-numeric order id is a 400", async () => {
++  const res = await refund("abc", "alice-token");
++  assert.equal(res.status, 400);
++  assert.equal((await res.json()).error.code, "invalid_id");
++});
++
++test("refund: someone else's order is a 404 and is not touched", async () => {
++  const res = await refund("1", "bob-token");
++  assert.equal(res.status, 404);
++  const { rows } = await pool.query("select status from orders where id = 1");
++  assert.equal(rows[0].status, "paid");
++});
++
++test("refund: the owner refunds a paid order in full, once", async () => {
++  const res = await refund("1", "alice-token");
++  assert.equal(res.status, 200);
++  const body = await res.json();
++  assert.equal(body.id, 1);
++  assert.equal(body.status, "refunded");
++  const { rows: calls } = await pool.query("select amount_cents from payment_calls where kind = 'refund' and payment_id = 'pay_seed_1'");
++  assert.deepEqual(calls, [{ amount_cents: 4000 }]);
++
++  const again = await refund("1", "alice-token");
++  assert.equal(again.status, 409);
++  assert.equal((await again.json()).error.code, "not_paid");
++});
++
++test("refund: parallel requests move money once and end refunded", async () => {
++  const results = await Promise.all(Array.from({ length: 10 }, () => refund("2", "alice-token")));
++  const statuses = results.map((r) => r.status);
++  assert.ok(statuses.every((s) => s === 200 || s === 409), `unexpected statuses: ${statuses}`);
++  const { rows: calls } = await pool.query("select count(*)::int as n from payment_calls where kind = 'refund' and payment_id = 'pay_seed_2'");
++  assert.equal(calls[0].n, 1);
++  const { rows } = await pool.query("select status from orders where id = 2");
++  assert.equal(rows[0].status, "refunded");
++});

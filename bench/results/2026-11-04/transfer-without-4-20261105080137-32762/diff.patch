@@ -1,0 +1,82 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..d580b3f 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -52,6 +52,48 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.post("/transfers", async (req, res) => {
++    const { toUserId, amountCents } = req.body ?? {};
++    if (!Number.isSafeInteger(toUserId) || !Number.isSafeInteger(amountCents) || amountCents <= 0) {
++      return sendError(res, 400, "invalid_request", "toUserId and amountCents must be integers; amountCents must be positive");
++    }
++    const fromUserId = res.locals.user.id;
++    if (toUserId === fromUserId) return sendError(res, 400, "invalid_request", "Cannot transfer to yourself");
++
++    const client = await pool.connect();
++    try {
++      await client.query("begin");
++      const recipient = await client.query("select id from users where id = $1", [toUserId]);
++      if (recipient.rows.length === 0) {
++        await client.query("rollback");
++        return sendError(res, 404, "not_found", "Recipient not found");
++      }
++      await client.query("insert into wallets (user_id, balance_cents) values ($1, 0) on conflict do nothing", [toUserId]);
++      // Lock both wallets in a consistent order so concurrent opposite transfers can't deadlock.
++      const locked = await client.query(
++        "select user_id, balance_cents from wallets where user_id = any($1) order by user_id for update",
++        [[fromUserId, toUserId]],
++      );
++      const sender = locked.rows.find((r) => r.user_id === fromUserId);
++      if (!sender || sender.balance_cents < amountCents) {
++        await client.query("rollback");
++        return sendError(res, 422, "insufficient_funds", "Insufficient store credit");
++      }
++      const { rows } = await client.query(
++        "update wallets set balance_cents = balance_cents - $2 where user_id = $1 returning balance_cents",
++        [fromUserId, amountCents],
++      );
++      await client.query("update wallets set balance_cents = balance_cents + $2 where user_id = $1", [toUserId, amountCents]);
++      await client.query("commit");
++      res.status(201).json({ toUserId, amountCents, balanceCents: rows[0].balance_cents });
++    } catch (err) {
++      await client.query("rollback").catch(() => {});
++      throw err;
++    } finally {
++      client.release();
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..a898d37 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,24 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++test("POST /transfers moves store credit and validates input", async () => {
++  const post = (token: string, body: unknown) =>
++    fetch(`${base}/transfers`, {
++      method: "POST",
++      headers: { ...as(token), "content-type": "application/json" },
++      body: JSON.stringify(body),
++    });
++  const bal = async (id: number) =>
++    (await pool.query("select balance_cents from wallets where user_id = $1", [id])).rows[0].balance_cents;
++  const a0 = await bal(1);
++  const b0 = await bal(2);
++  assert.equal((await post("alice-token", { toUserId: 2, amountCents: 300 })).status, 201);
++  assert.equal(await bal(1), a0 - 300);
++  assert.equal(await bal(2), b0 + 300);
++  assert.equal((await post("alice-token", { toUserId: 2, amountCents: 10_000_000 })).status, 422);
++  assert.equal((await post("alice-token", { toUserId: 2, amountCents: -5 })).status, 400);
++  assert.equal((await post("alice-token", { toUserId: 1, amountCents: 5 })).status, 400);
++  assert.equal((await post("alice-token", { toUserId: 999, amountCents: 5 })).status, 404);
++  assert.equal(await bal(1), a0 - 300);
++});

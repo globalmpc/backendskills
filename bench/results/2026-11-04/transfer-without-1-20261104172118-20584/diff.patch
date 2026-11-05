@@ -1,0 +1,126 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..14fc6d2 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -3,6 +3,8 @@ import { pool } from "./db.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
++const MAX_INT4 = 2_147_483_647; // amount columns are `integer`
++
+ declare global {
+   namespace Express {
+     interface Locals {
+@@ -52,6 +54,49 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  // Store credit transfer. Both wallet rows are locked (in user_id order, so opposite-direction
++  // transfers cannot deadlock) before the balance is checked, so concurrent transfers cannot overdraw.
++  app.post("/transfers", async (req, res) => {
++    const { toUserId, amountCents } = req.body ?? {};
++    if (!Number.isSafeInteger(toUserId) || toUserId <= 0 || !Number.isSafeInteger(amountCents) || amountCents <= 0 || amountCents > MAX_INT4) {
++      return sendError(res, 400, "invalid_body", "toUserId and amountCents must be positive integers");
++    }
++    const fromUserId = res.locals.user.id;
++    if (toUserId === fromUserId) return sendError(res, 400, "self_transfer", "Cannot transfer to yourself");
++
++    const client = await pool.connect();
++    try {
++      await client.query("begin");
++      const { rows: recipient } = await client.query("select 1 from users where id = $1", [toUserId]);
++      if (recipient.length === 0) {
++        await client.query("rollback");
++        return sendError(res, 404, "recipient_not_found", "Recipient does not exist");
++      }
++      await client.query(
++        "insert into wallets (user_id, balance_cents) values ($1, 0), ($2, 0) on conflict (user_id) do nothing",
++        [fromUserId, toUserId],
++      );
++      const { rows: wallets } = await client.query(
++        "select user_id, balance_cents from wallets where user_id = any($1::int[]) order by user_id for update",
++        [[fromUserId, toUserId]],
++      );
++      const balance = wallets.find((w) => w.user_id === fromUserId).balance_cents;
++      if (balance < amountCents) {
++        await client.query("rollback");
++        return sendError(res, 422, "insufficient_funds", "Not enough store credit");
++      }
++      await client.query("update wallets set balance_cents = balance_cents - $2 where user_id = $1", [fromUserId, amountCents]);
++      await client.query("update wallets set balance_cents = balance_cents + $2 where user_id = $1", [toUserId, amountCents]);
++      await client.query("commit");
++      res.status(201).json({ toUserId, amountCents, balanceCents: balance - amountCents });
++    } catch (err) {
++      await client.query("rollback").catch(() => {});
++      throw err;
++    } finally {
++      client.release();
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..387f55a 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,58 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const transfer = (token: string, body: unknown) =>
++  fetch(`${base}/transfers`, {
++    method: "POST",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++const balances = async () => {
++  const { rows } = await pool.query("select user_id, balance_cents from wallets order by user_id");
++  return Object.fromEntries(rows.map((r) => [r.user_id, r.balance_cents]));
++};
++
++test("transfer moves store credit from the caller to the recipient", async () => {
++  const res = await transfer("alice-token", { toUserId: 2, amountCents: 1500 });
++  assert.equal(res.status, 201);
++  assert.deepEqual(await res.json(), { toUserId: 2, amountCents: 1500, balanceCents: 8500 });
++  assert.deepEqual(await balances(), { 1: 8500, 2: 2000, 3: 0 });
++});
++
++test("transfer rejects an invalid body without moving money", async () => {
++  const bad = [{}, { toUserId: 2 }, { toUserId: "2", amountCents: 5 }, { toUserId: 2, amountCents: 0 }, { toUserId: 2, amountCents: -5 }, { toUserId: 2, amountCents: 1.5 }, { toUserId: 2, amountCents: 2 ** 31 }];
++  for (const body of bad) {
++    const res = await transfer("alice-token", body);
++    assert.equal(res.status, 400, JSON.stringify(body));
++    assert.equal((await res.json()).error.code, "invalid_body");
++  }
++  assert.deepEqual(await balances(), { 1: 8500, 2: 2000, 3: 0 });
++});
++
++test("transfer to yourself or an unknown user is rejected", async () => {
++  const self = await transfer("alice-token", { toUserId: 1, amountCents: 100 });
++  assert.equal(self.status, 400);
++  assert.equal((await self.json()).error.code, "self_transfer");
++
++  const unknown = await transfer("alice-token", { toUserId: 999, amountCents: 100 });
++  assert.equal(unknown.status, 404);
++  assert.equal((await unknown.json()).error.code, "recipient_not_found");
++  assert.deepEqual(await balances(), { 1: 8500, 2: 2000, 3: 0 });
++});
++
++test("transfer without enough store credit is rejected", async () => {
++  const res = await transfer("bob-token", { toUserId: 1, amountCents: 2001 });
++  assert.equal(res.status, 422);
++  assert.equal((await res.json()).error.code, "insufficient_funds");
++  assert.deepEqual(await balances(), { 1: 8500, 2: 2000, 3: 0 });
++});
++
++test("concurrent transfers cannot overdraw the sender", async () => {
++  // Alice has 8500; six transfers of 2000 race, so exactly four can succeed.
++  const results = await Promise.all(Array.from({ length: 6 }, () => transfer("alice-token", { toUserId: 2, amountCents: 2000 })));
++  const statuses = results.map((r) => r.status).sort();
++  assert.deepEqual(statuses, [201, 201, 201, 201, 422, 422]);
++  assert.deepEqual(await balances(), { 1: 500, 2: 10000, 3: 0 });
++});

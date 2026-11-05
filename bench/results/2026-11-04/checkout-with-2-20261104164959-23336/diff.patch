@@ -1,0 +1,328 @@
+diff --git a/migrations/002_order_constraints.sql b/migrations/002_order_constraints.sql
+new file mode 100644
+index 0000000..88816c1
+--- /dev/null
++++ b/migrations/002_order_constraints.sql
+@@ -0,0 +1,5 @@
++-- Stock, quantities and order statuses can't go out of range, whatever the code does.
++-- Tables are small (products, order_items, orders); the checks are added directly.
++alter table products add constraint products_stock_nonnegative check (stock >= 0);
++alter table order_items add constraint order_items_quantity_positive check (quantity > 0);
++alter table orders add constraint orders_status_known check (status in ('pending', 'paid', 'refunded', 'failed'));
+diff --git a/migrations/down/002_order_constraints.sql b/migrations/down/002_order_constraints.sql
+new file mode 100644
+index 0000000..35ec8e4
+--- /dev/null
++++ b/migrations/down/002_order_constraints.sql
+@@ -0,0 +1,3 @@
++alter table orders drop constraint orders_status_known;
++alter table order_items drop constraint order_items_quantity_positive;
++alter table products drop constraint products_stock_nonnegative;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..832ea73 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,15 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    {
++      "name": "Place order",
++      "request": {
++        "method": "POST",
++        "url": "{{baseUrl}}/orders",
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "body": { "mode": "raw", "raw": "{\n  \"items\": [\n    { \"productId\": 1, \"quantity\": 2 },\n    { \"productId\": 2, \"quantity\": 1 }\n  ]\n}" }
++      }
++    }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..a2204ff 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,8 +1,119 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+-import { pool } from "./db.ts";
++import { pool, withTransaction } from "./db.ts";
++import { payments } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
++// Expected failures thrown from handlers; the error middleware turns them into the standard error format.
++export class HttpError extends Error {
++  constructor(
++    readonly status: number,
++    readonly code: string,
++    message: string,
++  ) {
++    super(message);
++  }
++}
++
++const MAX_INT = 2_147_483_647; // ids, quantities, stock and total_cents are 32-bit integer columns
++
++// Validates the body and merges duplicate product lines, so each product appears once.
++function parseOrderItems(body: unknown): Map<number, number> {
++  const items = (body as { items?: unknown } | undefined)?.items;
++  if (!Array.isArray(items) || items.length === 0) {
++    throw new HttpError(400, "invalid_items", "items must be a non-empty array");
++  }
++  const quantities = new Map<number, number>();
++  for (const item of items) {
++    const { productId, quantity } = (item ?? {}) as { productId?: unknown; quantity?: unknown };
++    if (typeof productId !== "number" || !Number.isInteger(productId) || productId < 1 || productId > MAX_INT) {
++      throw new HttpError(400, "invalid_item", "productId must be a positive integer");
++    }
++    if (typeof quantity !== "number" || !Number.isInteger(quantity) || quantity < 1 || quantity > MAX_INT) {
++      throw new HttpError(400, "invalid_item", "quantity must be a positive integer");
++    }
++    quantities.set(productId, (quantities.get(productId) ?? 0) + quantity);
++  }
++  return quantities;
++}
++
++type OrderItem = { product_id: number; quantity: number; price_cents: number };
++
++// Reserves the stock, charges the total through the payment provider, and marks the order paid.
++async function placeOrder(userId: number, quantities: Map<number, number>) {
++  const productIds = [...quantities.keys()].sort((a, b) => a - b);
++
++  // 1. One short transaction with no outside calls. Products are locked in id order (no deadlocks),
++  //    stock is checked and taken, and a pending order is recorded.
++  const { orderId, createdAt, total, items } = await withTransaction(async (client) => {
++    const { rows: products } = await client.query<{ id: number; price_cents: number; stock: number }>(
++      "select id, price_cents, stock from products where id = any($1::int[]) order by id for update",
++      [productIds],
++    );
++    if (products.length !== productIds.length) {
++      throw new HttpError(400, "unknown_product", "One of the products does not exist");
++    }
++    let total = 0;
++    for (const p of products) {
++      const quantity = quantities.get(p.id)!;
++      if (p.stock < quantity) throw new HttpError(409, "insufficient_stock", `Not enough stock for product ${p.id}`);
++      total += p.price_cents * quantity;
++    }
++    if (total > MAX_INT) throw new HttpError(400, "order_too_large", "Order total is too large");
++
++    for (const p of products) {
++      const quantity = quantities.get(p.id)!;
++      // The condition repeats the check in the write itself; the CHECK constraint is the last line of defence.
++      const { rowCount } = await client.query(
++        "update products set stock = stock - $2 where id = $1 and stock >= $2",
++        [p.id, quantity],
++      );
++      if (rowCount !== 1) throw new HttpError(409, "insufficient_stock", `Not enough stock for product ${p.id}`);
++    }
++
++    const { rows: [order] } = await client.query<{ id: number; created_at: Date }>(
++      "insert into orders (user_id, status, total_cents) values ($1, 'pending', $2) returning id, created_at",
++      [userId, total],
++    );
++    const items: OrderItem[] = products.map((p) => ({
++      product_id: p.id,
++      quantity: quantities.get(p.id)!,
++      price_cents: p.price_cents,
++    }));
++    for (const item of items) {
++      await client.query(
++        "insert into order_items (order_id, product_id, quantity, price_cents) values ($1, $2, $3, $4)",
++        [order.id, item.product_id, item.quantity, item.price_cents],
++      );
++    }
++    return { orderId: order.id, createdAt: order.created_at, total, items };
++  });
++
++  // 2. The provider call happens outside any transaction. The key comes from our order id, so a retry can't charge twice.
++  let paymentId: string;
++  try {
++    ({ paymentId } = await payments.charge({ amountCents: total, idempotencyKey: `order-${orderId}` }));
++  } catch {
++    // Give the stock back and close the order.
++    await withTransaction(async (client) => {
++      for (const item of items) {
++        await client.query("update products set stock = stock + $2 where id = $1", [item.product_id, item.quantity]);
++      }
++      await client.query("update orders set status = 'failed' where id = $1 and status = 'pending'", [orderId]);
++    });
++    throw new HttpError(502, "payment_failed", "Payment failed");
++  }
++
++  // 3. Record the payment on the order.
++  const { rowCount } = await pool.query(
++    "update orders set status = 'paid', payment_id = $2 where id = $1 and status = 'pending'",
++    [orderId, paymentId],
++  );
++  if (rowCount !== 1) throw new Error(`order ${orderId} was not pending when payment completed`);
++
++  return { id: orderId, status: "paid", total_cents: total, created_at: createdAt, items };
++}
++
+ declare global {
+   namespace Express {
+     interface Locals {
+@@ -52,7 +163,17 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.post("/orders", async (req, res) => {
++    const quantities = parseOrderItems(req.body);
++    const order = await placeOrder(res.locals.user.id, quantities);
++    res.status(201).json(order);
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
++    if (err instanceof HttpError) return sendError(res, err.status, err.code, err.message);
++    if ((err as { type?: unknown }).type === "entity.parse.failed") {
++      return sendError(res, 400, "invalid_json", "Request body is not valid JSON");
++    }
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+   });
+diff --git a/src/db.ts b/src/db.ts
+index db79507..0cc4b95 100644
+--- a/src/db.ts
++++ b/src/db.ts
+@@ -3,3 +3,20 @@ import pg from "pg";
+ export const databaseUrl = process.env.DATABASE_URL ?? "postgres://postgres:postgres@localhost:5433/shop";
+ 
+ export const pool = new pg.Pool({ connectionString: databaseUrl });
++
++// Runs fn in one transaction on a single connection. Commits if fn resolves, rolls back if it throws.
++// Don't call outside services (payments, email) inside fn: the locks stay held while they run.
++export async function withTransaction<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
++  const client = await pool.connect();
++  try {
++    await client.query("begin");
++    const result = await fn(client);
++    await client.query("commit");
++    return result;
++  } catch (err) {
++    await client.query("rollback");
++    throw err;
++  } finally {
++    client.release();
++  }
++}
+diff --git a/test/orders.test.ts b/test/orders.test.ts
+new file mode 100644
+index 0000000..a7cbbcb
+--- /dev/null
++++ b/test/orders.test.ts
+@@ -0,0 +1,113 @@
++import { test, before, after } from "node:test";
++import assert from "node:assert/strict";
++import type { Server } from "node:http";
++import { resetDatabase } from "../src/migrate.ts";
++import { createApp } from "../src/app.ts";
++import { pool } from "../src/db.ts";
++import { payments } from "../src/payments.ts";
++
++let server: Server;
++let base: string;
++
++before(async () => {
++  await resetDatabase();
++  server = createApp().listen(0);
++  const address = server.address();
++  if (address === null || typeof address === "string") throw new Error("no port");
++  base = `http://localhost:${address.port}`;
++});
++
++after(async () => {
++  server.close();
++  await pool.end();
++});
++
++const as = (token: string) => ({ authorization: `Bearer ${token}`, "content-type": "application/json" });
++
++const placeOrder = (token: string, body: unknown, raw?: string) =>
++  fetch(`${base}/orders`, { method: "POST", headers: as(token), body: raw ?? JSON.stringify(body) });
++
++const stockOf = async (productId: number) =>
++  (await pool.query("select stock from products where id = $1", [productId])).rows[0].stock as number;
++
++const ordersOf = async (userId: number) =>
++  (await pool.query("select count(*)::int as n from orders where user_id = $1", [userId])).rows[0].n as number;
++
++test("places an order: merges duplicate lines, takes stock, charges the total, returns the order", async () => {
++  const stockBefore = { tshirt: await stockOf(1), mug: await stockOf(2) };
++  const res = await placeOrder("alice-token", { items: [{ productId: 1, quantity: 1 }, { productId: 1, quantity: 1 }, { productId: 2, quantity: 1 }] });
++  assert.equal(res.status, 201);
++  const order = await res.json();
++  assert.equal(order.status, "paid");
++  assert.equal(order.total_cents, 2000 * 2 + 1200);
++  assert.deepEqual(
++    order.items.map((i: { product_id: number; quantity: number }) => [i.product_id, i.quantity]),
++    [[1, 2], [2, 1]],
++  );
++  assert.equal(await stockOf(1), stockBefore.tshirt - 2);
++  assert.equal(await stockOf(2), stockBefore.mug - 1);
++
++  const { rows } = await pool.query("select status, payment_id from orders where id = $1", [order.id]);
++  assert.equal(rows[0].status, "paid");
++  assert.match(rows[0].payment_id, /^pay_/);
++});
++
++test("insufficient stock is a 409 and changes nothing", async () => {
++  const stockBefore = await stockOf(3);
++  const ordersBefore = await ordersOf(1);
++  const res = await placeOrder("alice-token", { items: [{ productId: 3, quantity: stockBefore + 1 }] });
++  assert.equal(res.status, 409);
++  assert.equal((await res.json()).error.code, "insufficient_stock");
++  assert.equal(await stockOf(3), stockBefore);
++  assert.equal(await ordersOf(1), ordersBefore);
++});
++
++test("bad input is a 4xx, never a 500", async () => {
++  const cases: [string, unknown, string | undefined][] = [
++    ["empty items", { items: [] }, undefined],
++    ["missing items", {}, undefined],
++    ["quantity zero", { items: [{ productId: 1, quantity: 0 }] }, undefined],
++    ["fractional quantity", { items: [{ productId: 1, quantity: 1.5 }] }, undefined],
++    ["string productId", { items: [{ productId: "1", quantity: 1 }] }, undefined],
++    ["productId out of range", { items: [{ productId: 1e20, quantity: 1 }] }, undefined],
++    ["unknown product", { items: [{ productId: 9999, quantity: 1 }] }, undefined],
++    ["malformed JSON", undefined, "{not json"],
++  ];
++  for (const [name, body, raw] of cases) {
++    const res = await placeOrder("alice-token", body, raw);
++    assert.ok(res.status >= 400 && res.status < 500, `${name}: got ${res.status}`);
++    assert.ok((await res.json()).error?.code, `${name}: missing error code`);
++  }
++});
++
++test("a failed payment gives the stock back and marks the order failed", async () => {
++  const stockBefore = await stockOf(1);
++  const ordersBefore = await ordersOf(1);
++  const original = payments.charge;
++  payments.charge = async () => {
++    throw new Error("provider down");
++  };
++  try {
++    const res = await placeOrder("alice-token", { items: [{ productId: 1, quantity: 3 }] });
++    assert.equal(res.status, 502);
++    assert.equal((await res.json()).error.code, "payment_failed");
++  } finally {
++    payments.charge = original;
++  }
++  assert.equal(await stockOf(1), stockBefore);
++  assert.equal(await ordersOf(1), ordersBefore + 1);
++  const { rows } = await pool.query("select status from orders where user_id = 1 order by id desc limit 1");
++  assert.equal(rows[0].status, "failed");
++});
++
++test("parallel orders never oversell: exactly the available stock is sold", async () => {
++  const available = await stockOf(3);
++  assert.equal(available, 5);
++  const results = await Promise.all(
++    Array.from({ length: 10 }, (_, i) => placeOrder(i % 2 ? "bob-token" : "alice-token", { items: [{ productId: 3, quantity: 1 }] })),
++  );
++  const statuses = results.map((r) => r.status).sort();
++  assert.equal(statuses.filter((s) => s === 201).length, available);
++  assert.equal(statuses.filter((s) => s === 409).length, 10 - available);
++  assert.equal(await stockOf(3), 0);
++});

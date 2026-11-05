@@ -1,0 +1,8 @@
+# One Postgres for the sample app, its tests and every bench run (each run gets its own database).
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"

@@ -1,0 +1,45 @@
+✔ the right password returns the user's token (59.618833ms)
+✔ a wrong password and an unknown email get the same 401 (62.980167ms)
+✔ bad input gets a 4xx, not a server error (2.320209ms)
+✖ guessing a password one try at a time gets stopped (633.626333ms)
+✖ 50 guesses at once get stopped too (306.473125ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 3
+ℹ fail 2
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1237.86325
+
+✖ failing tests:
+
+test at hidden-check/check.test.ts:1:1364
+✖ guessing a password one try at a time gets stopped (633.626333ms)
+  AssertionError [ERR_ASSERTION]: the 31st try still logged in (status 200)
+      at TestContext.<anonymous> (/private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-BRZonO/app/hidden-check/check.test.ts:38:10)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at hidden-check/check.test.ts:1:1695
+✖ 50 guesses at once get stopped too (306.473125ms)
+  AssertionError [ERR_ASSERTION]: only 0 of 50 parallel guesses were refused with 429
+      at TestContext.<anonymous> (/private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-BRZonO/app/hidden-check/check.test.ts:47:10)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }

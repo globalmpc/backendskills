@@ -1,0 +1,13 @@
+✔ a transfer moves the money (73.159084ms)
+✔ 10 transfers at once never overdraw or create money (45.73025ms)
+✔ a negative amount is rejected and nothing moves (4.946708ms)
+✔ transfers both ways at once all go through (no deadlock) (50.242333ms)
+✔ a transfer to a user who doesn't exist, or of a fractional amount, is rejected and nothing moves (2.177166ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 5
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 424.573417

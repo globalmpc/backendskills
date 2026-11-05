@@ -1,0 +1,90 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..f8dbb00 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,7 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "Get one of my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders/1" } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..54a7f70 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -52,6 +52,28 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.get("/orders/:id", async (req, res) => {
++    const id = req.params.id;
++    // Postgres `integer` tops out at 2147483647; anything larger can't be an order id.
++    if (!/^[1-9]\d{0,9}$/.test(id) || Number(id) > 2147483647) {
++      return sendError(res, 400, "invalid_id", "Order id must be a positive integer");
++    }
++    const userId = res.locals.user.id;
++    // Scoped to the caller: someone else's order looks the same as a missing one.
++    const { rows: [order] } = await pool.query(
++      "select id, status, total_cents, created_at from orders where id = $1 and user_id = $2",
++      [id, userId],
++    );
++    if (!order) return sendError(res, 404, "not_found", "Order not found");
++    const { rows: items } = await pool.query(
++      `select oi.product_id, p.name, oi.quantity, oi.price_cents
++         from order_items oi join products p on p.id = oi.product_id
++        where oi.order_id = $1 order by oi.product_id`,
++      [order.id],
++    );
++    res.json({ ...order, items });
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..88d3668 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -50,6 +50,39 @@ test("/orders lists only the caller's orders", async () => {
+   assert.equal(bob.length, 1);
+ });
+ 
++test("/orders/:id returns the caller's order with its items", async () => {
++  const res = await fetch(`${base}/orders/1`, { headers: as("alice-token") });
++  assert.equal(res.status, 200);
++  const order = await res.json();
++  assert.equal(order.id, 1);
++  assert.equal(order.status, "paid");
++  assert.equal(order.total_cents, 4000);
++  assert.equal(order.payment_id, undefined);
++  assert.deepEqual(order.items, [{ product_id: 1, name: "T-shirt", quantity: 2, price_cents: 2000 }]);
++});
++
++test("/orders/:id returns 404 for another user's order, same as a missing one", async () => {
++  const other = await fetch(`${base}/orders/3`, { headers: as("alice-token") });
++  const missing = await fetch(`${base}/orders/999999`, { headers: as("alice-token") });
++  assert.equal(other.status, 404);
++  assert.equal(missing.status, 404);
++  assert.deepEqual(await other.json(), { error: { code: "not_found", message: "Order not found" } });
++  assert.deepEqual(await missing.json(), { error: { code: "not_found", message: "Order not found" } });
++});
++
++test("/orders/:id rejects ids that are not positive integers in range with 400", async () => {
++  for (const bad of ["abc", "0", "-1", "1.5", "99999999999999"]) {
++    const res = await fetch(`${base}/orders/${bad}`, { headers: as("alice-token") });
++    assert.equal(res.status, 400, bad);
++    assert.equal((await res.json()).error.code, "invalid_id");
++  }
++});
++
++test("/orders/:id requires a token", async () => {
++  const res = await fetch(`${base}/orders/1`);
++  assert.equal(res.status, 401);
++});
++
+ test("/products lists products with stock", async () => {
+   const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
+   assert.equal(products.length, 3);

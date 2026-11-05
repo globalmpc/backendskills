@@ -1,0 +1,125 @@
+<!doctype html>
+<!-- Source of docs/promo.gif (square, for social posts). Each frame is ?f=<frame>; build with
+     scripts/demo-gif.sh promo. Numbers come from bench/results/2026-11-04 (Sonnet 5.5 + Haiku 5.5). -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --lime: #b8f53d; --red: #ff5c5c; --text: #f2f4f7; --muted: #8a93a3; --panel: #0e131b; --line: #232b38;
+          --mono: "SF Mono", Menlo, monospace; }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { width: 720px; height: 720px; overflow: hidden; color: var(--text);
+               font-family: -apple-system, "SF Pro Display", "Helvetica Neue", sans-serif; }
+  body { background:
+           radial-gradient(circle at 30% 18%, var(--glow) 0, transparent 55%),
+           linear-gradient(#ffffff08 1px, transparent 1px) 0 0 / 48px 48px,
+           linear-gradient(90deg, #ffffff08 1px, transparent 1px) 0 0 / 48px 48px,
+           #090d14; }
+  body.g { --glow: #b8f53d22; } body.r { --glow: #ff5c5c22; }
+  section { display: none; height: 100%; padding: 64px 60px; flex-direction: column; justify-content: center; }
+  section.on { display: flex; }
+  .x { visibility: hidden; } .x.shown { visibility: visible; }
+  .comment { font-family: var(--mono); color: var(--muted); font-size: 22px; margin-bottom: 18px; }
+  .hook { font-size: 64px; font-weight: 800; line-height: 1.12; letter-spacing: -.02em; }
+  .lime { color: var(--lime); } .red { color: var(--red); }
+  .cursor { color: var(--lime); font-weight: 400; }
+
+  .term { background: var(--panel); border: 1px solid var(--line); border-radius: 16px; position: relative; }
+  .dots { padding: 16px 20px; border-bottom: 1px solid var(--line); display: flex; gap: 8px; align-items: center; }
+  .dots i { width: 11px; height: 11px; border-radius: 50%; background: #3a4352; }
+  .dots span { margin-left: 12px; font-family: var(--mono); color: var(--muted); font-size: 17px; }
+  .body { padding: 26px 28px 30px; font-family: var(--mono); font-size: 25px; min-height: 300px; padding-bottom: 60px; }
+  .prompt { color: var(--lime); }
+  .row { display: flex; justify-content: space-between; margin-top: 22px; color: #d5dae2; }
+  .row b { color: var(--red); }
+  .stamp { position: absolute; left: 50%; top: 100%; transform: translate(-50%, -50%) rotate(-8deg);
+           border: 7px solid var(--red); border-radius: 14px; padding: 6px 26px; color: var(--red);
+           font-size: 66px; font-weight: 900; letter-spacing: -.01em; white-space: nowrap; background: #090d14e6; }
+
+  .huge { font-size: 170px; font-weight: 900; line-height: .95; letter-spacing: -.04em; }
+  .what { font-size: 44px; font-weight: 800; margin-top: 8px; }
+  .small { font-size: 22px; color: var(--muted); margin-top: 8px; }
+  .chips { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 34px; }
+  .chip { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px;
+          font-size: 22px; font-weight: 600; }
+  .chip::before { content: "✗  "; color: var(--red); font-weight: 800; }
+
+  .bars { margin-top: 36px; display: grid; gap: 26px; }
+  .bar .lbl { display: flex; justify-content: space-between; font-size: 24px; font-weight: 600; margin-bottom: 10px; }
+  .bar .lbl span { color: var(--muted); }
+  .track { height: 14px; background: #1b222d; border-radius: 7px; overflow: hidden; }
+  .fill { height: 100%; border-radius: 7px; background: var(--red); }
+  .fixed .fill { background: var(--lime); }
+
+  #c { align-items: center; text-align: center; }
+  .pill { font-family: var(--mono); font-size: 22px; white-space: nowrap; font-weight: 700; background: #b8f53d33; color: #b8f53d66;
+          border-radius: 999px; padding: 18px 30px; }
+  .pill.shown { background: var(--lime); color: #0a0f05; }
+  #c h2 { font-size: 46px; font-weight: 800; margin-top: 36px; letter-spacing: -.01em; }
+  #c .small { font-size: 24px; margin-top: 14px; }
+</style>
+</head>
+<body>
+
+<section id="h">
+  <div class="comment">// backend devs, listen up</div>
+  <div class="hook">Is your<br><span class="x" data-at="2">AI-written backend</span><br><span class="x lime" data-at="3">safe in prod?</span><span class="cursor">|</span></div>
+</section>
+
+<section id="t">
+  <div class="term">
+    <div class="dots"><i></i><i></i><i></i><span>claude · without skills</span></div>
+    <div class="body">
+      <div><span class="prompt">$</span> <span class="x" data-at="1">run hidden checks</span></div>
+      <div class="row x" data-at="2">› password guessing <b>FAIL</b></div>
+      <div class="row x" data-at="3">› rolling deploy <b>FAIL</b></div>
+      <div class="row x" data-at="4">› 20 buyers, 5 in stock <b>FAIL</b></div>
+    </div>
+    <div class="stamp x" data-at="5">BREAKS IN PROD</div>
+  </div>
+</section>
+
+<section id="p">
+  <div class="huge red">25</div>
+  <div class="what">critical mistakes</div>
+  <div class="small">in 150 runs of real backend tasks, no skills</div>
+  <div class="chips">
+    <div class="chip x" data-at="2">No login limit</div>
+    <div class="chip x" data-at="3">Deploy crashes app</div>
+    <div class="chip x" data-at="4">Overselling stock</div>
+    <div class="chip x" data-at="5">Refund undone</div>
+  </div>
+</section>
+
+<section id="f">
+  <div class="huge lime">−92%</div>
+  <div class="what">with backendskills</div>
+  <div class="small">critical mistakes, without → with the skills</div>
+  <div class="bars" id="bars">
+    <div class="bar"><div class="lbl">Sonnet 5.5 <span data-a="13" data-b="13 → 0"></span></div><div class="track"><div class="fill" data-a="100" data-b="0"></div></div></div>
+    <div class="bar"><div class="lbl">Haiku 5.5 <span data-a="12" data-b="12 → 2"></span></div><div class="track"><div class="fill" data-a="92" data-b="15"></div></div></div>
+  </div>
+</section>
+
+<section id="c">
+  <div class="pill" data-at="2">npx skills add globalmpc/backendskills</div>
+  <h2>Ship backend like a senior.</h2>
+  <div class="small">Claude Code · Codex · Cursor</div>
+</section>
+
+<script>
+  const f = new URLSearchParams(location.search).get("f") || "c2";
+  const scene = f[0], step = +f.slice(1);
+  document.body.className = scene === "t" || scene === "p" ? "r" : "g";
+  document.getElementById(scene).classList.add("on");
+  document.querySelectorAll(`#${scene} [data-at]`).forEach((el) => el.classList.toggle("shown", step >= +el.dataset.at));
+  if (scene === "f") {
+    const k = step >= 2 ? "b" : "a";
+    document.getElementById("bars").classList.toggle("fixed", k === "b");
+    document.querySelectorAll("#bars [data-a]").forEach((el) =>
+      el.classList.contains("fill") ? (el.style.width = el.dataset[k] + "%") : (el.textContent = el.dataset[k]));
+  }
+  if (scene === "h" && step < 3) document.querySelector(".cursor").style.visibility = step % 2 ? "visible" : "hidden";
+</script>
+</body>
+</html>

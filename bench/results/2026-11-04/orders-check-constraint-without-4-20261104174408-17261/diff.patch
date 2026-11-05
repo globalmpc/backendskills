@@ -1,0 +1,19 @@
+diff --git a/migrations/002_orders_total_nonnegative_add.sql b/migrations/002_orders_total_nonnegative_add.sql
+new file mode 100644
+index 0000000..e357112
+--- /dev/null
++++ b/migrations/002_orders_total_nonnegative_add.sql
+@@ -0,0 +1,4 @@
++-- NOT VALID: enforced for new/updated rows immediately, but existing rows are not scanned,
++-- so the ACCESS EXCLUSIVE lock on the large orders table is held only momentarily.
++-- Validated in 003 (separate file => separate transaction).
++alter table orders add constraint orders_total_cents_nonnegative check (total_cents >= 0) not valid;
+diff --git a/migrations/003_orders_total_nonnegative_validate.sql b/migrations/003_orders_total_nonnegative_validate.sql
+new file mode 100644
+index 0000000..0d1ea6e
+--- /dev/null
++++ b/migrations/003_orders_total_nonnegative_validate.sql
+@@ -0,0 +1,3 @@
++-- Scans existing rows under SHARE UPDATE EXCLUSIVE, which doesn't block reads or writes.
++-- Must stay in its own file: in the same transaction as 002 the stronger lock would be held during the scan.
++alter table orders validate constraint orders_total_cents_nonnegative;

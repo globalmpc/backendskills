@@ -1,0 +1,1 @@
+Add `POST /login` so users can sign in with their email and password. Body: `{ "email": string, "password": string }`. On success, respond with `{ "token": <the user's api_token> }`. It must work without a token, since that's what the client is trying to get.

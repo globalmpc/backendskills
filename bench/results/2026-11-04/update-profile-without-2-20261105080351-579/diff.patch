@@ -1,0 +1,79 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..acc914d 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -39,6 +39,42 @@ export function createApp() {
+     res.json(res.locals.user);
+   });
+ 
++  app.patch("/users/:id", async (req, res) => {
++    const id = Number(req.params.id);
++    if (!Number.isInteger(id) || id <= 0) return sendError(res, 400, "invalid_id", "Invalid user id");
++    const caller = res.locals.user;
++    if (caller.id !== id && caller.role !== "admin") {
++      return sendError(res, 403, "forbidden", "You can only update your own profile");
++    }
++
++    const body = req.body ?? {};
++    const { name, email } = body;
++    if (name === undefined && email === undefined) {
++      return sendError(res, 400, "invalid_request", "Provide name and/or email");
++    }
++    if (name !== undefined && (typeof name !== "string" || name.trim() === "")) {
++      return sendError(res, 400, "invalid_name", "name must be a non-empty string");
++    }
++    if (email !== undefined && (typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim()))) {
++      return sendError(res, 400, "invalid_email", "email must be a valid email address");
++    }
++
++    try {
++      const { rows } = await pool.query(
++        `update users set name = coalesce($1, name), email = coalesce($2, email)
++         where id = $3 returning id, email, name, role`,
++        [name?.trim() ?? null, email?.trim() ?? null, id],
++      );
++      if (rows.length === 0) return sendError(res, 404, "not_found", "User not found");
++      res.json(rows[0]);
++    } catch (err) {
++      if ((err as { code?: string }).code === "23505") {
++        return sendError(res, 409, "email_taken", "Email is already in use");
++      }
++      throw err;
++    }
++  });
++
+   app.get("/products", async (_req, res) => {
+     const { rows } = await pool.query("select id, name, price_cents, stock from products order by id");
+     res.json(rows);
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..065a48e 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -56,6 +56,27 @@ test("/products lists products with stock", async () => {
+   assert.equal(products.find((p: { name: string }) => p.name === "Limited sneaker").stock, 5);
+ });
+ 
++const patch = (id: number, token: string, body: unknown) =>
++  fetch(`${base}/users/${id}`, {
++    method: "PATCH",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("PATCH /users/:id updates own name and email", async () => {
++  const res = await patch(2, "bob-token", { name: "Bobby", email: "bobby@example.com" });
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { id: 2, email: "bobby@example.com", name: "Bobby", role: "user" });
++});
++
++test("PATCH /users/:id rejects other users, bad input, duplicate emails", async () => {
++  assert.equal((await patch(1, "bob-token", { name: "x" })).status, 403);
++  assert.equal((await patch(1, "alice-token", {})).status, 400);
++  assert.equal((await patch(1, "alice-token", { email: "nope" })).status, 400);
++  assert.equal((await patch(1, "alice-token", { email: "admin@example.com" })).status, 409);
++  assert.equal((await patch(999, "admin-token", { name: "x" })).status, 404);
++});
++
+ test("payments client records every call; the same idempotency key is charged once", async () => {
+   const first = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });
+   const again = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });

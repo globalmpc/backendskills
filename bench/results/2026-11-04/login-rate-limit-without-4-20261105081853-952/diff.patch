@@ -1,0 +1,44 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..12ef347 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { hashPassword, verifyPassword } from "./passwords.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -25,6 +26,9 @@ async function auth(req: Request, res: Response, next: NextFunction) {
+   next();
+ }
+ 
++// Checked against when the email is unknown, so response time doesn't reveal which emails exist.
++const dummyHash = hashPassword("dummy-password-for-timing");
++
+ export function createApp() {
+   const app = express();
+   app.use(express.json());
+@@ -33,6 +37,22 @@ export function createApp() {
+     res.json({ ok: true });
+   });
+ 
++  app.post("/login", async (req, res) => {
++    const { email, password } = req.body ?? {};
++    if (typeof email !== "string" || typeof password !== "string" || !email || !password) {
++      return sendError(res, 400, "invalid_request", "email and password are required");
++    }
++    const { rows } = await pool.query("select api_token, password_hash from users where email = $1", [email]);
++    let ok = false;
++    if (rows.length > 0) {
++      ok = await verifyPassword(password, rows[0].password_hash);
++    } else {
++      await verifyPassword(password, await dummyHash);
++    }
++    if (!ok) return sendError(res, 401, "invalid_credentials", "Invalid email or password");
++    res.json({ token: rows[0].api_token });
++  });
++
+   app.use(auth);
+ 
+   app.get("/me", (_req, res) => {

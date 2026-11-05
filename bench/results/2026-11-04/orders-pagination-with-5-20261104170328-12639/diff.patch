@@ -1,0 +1,108 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..b0a5bfb 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,7 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "List my orders (next page)", "request": { "method": "GET", "url": "{{baseUrl}}/orders?cursor={{nextCursor}}" } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..5ad184a 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -15,6 +15,20 @@ export function sendError(res: Response, status: number, code: string, message:
+   res.status(status).json({ error: { code, message } });
+ }
+ 
++const ORDERS_PAGE_SIZE = 20;
++
++// The cursor is the id of the last order on the previous page, base64url-encoded so clients treat it as opaque.
++function encodeCursor(id: number) {
++  return Buffer.from(String(id)).toString("base64url");
++}
++
++function decodeCursor(cursor: string): number | null {
++  const text = Buffer.from(cursor, "base64url").toString("utf8");
++  if (!/^[1-9]\d*$/.test(text)) return null;
++  const id = Number(text);
++  return id <= 2147483647 ? id : null; // orders.id is a 32-bit serial
++}
++
+ async function auth(req: Request, res: Response, next: NextFunction) {
+   const token = req.headers.authorization?.replace(/^Bearer /, "");
+   const { rows } = token
+@@ -44,12 +58,23 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
+-  app.get("/orders", async (_req, res) => {
++  app.get("/orders", async (req, res) => {
++    let before: number | null = null;
++    if (req.query.cursor !== undefined) {
++      const id = typeof req.query.cursor === "string" ? decodeCursor(req.query.cursor) : null;
++      if (id === null) return sendError(res, 400, "invalid_cursor", "Invalid cursor");
++      before = id;
++    }
++    // One extra row tells us whether another page exists.
+     const { rows } = await pool.query(
+-      "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
+-      [res.locals.user.id],
++      `select id, status, total_cents, created_at from orders
++       where user_id = $1 and ($2::int is null or id < $2::int)
++       order by id desc limit $3`,
++      [res.locals.user.id, before, ORDERS_PAGE_SIZE + 1],
+     );
+-    res.json(rows);
++    const orders = rows.slice(0, ORDERS_PAGE_SIZE);
++    const nextCursor = rows.length > ORDERS_PAGE_SIZE ? encodeCursor(orders[orders.length - 1].id) : null;
++    res.json({ orders, nextCursor });
+   });
+ 
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..cc87762 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -46,8 +46,35 @@ test("/me returns the caller", async () => {
+ test("/orders lists only the caller's orders", async () => {
+   const alice = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
+   const bob = await (await fetch(`${base}/orders`, { headers: as("bob-token") })).json();
+-  assert.equal(alice.length, 2);
+-  assert.equal(bob.length, 1);
++  assert.equal(alice.orders.length, 2);
++  assert.equal(bob.orders.length, 1);
++  assert.equal(alice.nextCursor, null);
++});
++
++test("/orders pages newest first, 20 per page, following nextCursor", async () => {
++  await pool.query("insert into users (email, name, api_token, password_hash) values ('carol@example.com', 'Carol', 'carol-token', 'unused')");
++  await pool.query("insert into orders (user_id, total_cents) select id, 100 from users, generate_series(1, 45) where email = 'carol@example.com'");
++  const seen: number[] = [];
++  let cursor: string | null = null;
++  const pageSizes: number[] = [];
++  do {
++    const url: string = cursor === null ? `${base}/orders` : `${base}/orders?cursor=${encodeURIComponent(cursor)}`;
++    const page: { orders: { id: number }[]; nextCursor: string | null } = await (
++      await fetch(url, { headers: as("carol-token") })
++    ).json();
++    pageSizes.push(page.orders.length);
++    seen.push(...page.orders.map((o) => o.id));
++    cursor = page.nextCursor;
++  } while (cursor !== null);
++  assert.deepEqual(pageSizes, [20, 20, 5]);
++  assert.equal(new Set(seen).size, 45);
++  assert.deepEqual(seen, [...seen].sort((a, b) => b - a));
++});
++
++test("/orders rejects a malformed cursor with 400", async () => {
++  const res = await fetch(`${base}/orders?cursor=not-a-cursor!`, { headers: as("alice-token") });
++  assert.equal(res.status, 400);
++  assert.equal((await res.json()).error.code, "invalid_cursor");
+ });
+ 
+ test("/products lists products with stock", async () => {

@@ -1,0 +1,291 @@
+diff --git a/migrations/002_wallet_non_negative.sql b/migrations/002_wallet_non_negative.sql
+new file mode 100644
+index 0000000..761ba95
+--- /dev/null
++++ b/migrations/002_wallet_non_negative.sql
+@@ -0,0 +1,3 @@
++-- Balances can never go negative. Added without scanning the table (not valid); 003 validates it.
++set local lock_timeout = '5s';
++alter table wallets add constraint wallets_balance_non_negative check (balance_cents >= 0) not valid;
+diff --git a/migrations/003_wallet_non_negative_validate.sql b/migrations/003_wallet_non_negative_validate.sql
+new file mode 100644
+index 0000000..30bc279
+--- /dev/null
++++ b/migrations/003_wallet_non_negative_validate.sql
+@@ -0,0 +1,2 @@
++-- Checks the existing rows against the constraint added in 002. Does not block writes.
++alter table wallets validate constraint wallets_balance_non_negative;
+diff --git a/migrations/004_transfers.sql b/migrations/004_transfers.sql
+new file mode 100644
+index 0000000..2250845
+--- /dev/null
++++ b/migrations/004_transfers.sql
+@@ -0,0 +1,9 @@
++-- One row per store-credit transfer between two users. Written in the same transaction as the wallet changes.
++create table transfers (
++  id serial primary key,
++  from_user_id integer not null references users(id),
++  to_user_id integer not null references users(id),
++  amount_cents integer not null check (amount_cents > 0),
++  created_at timestamptz not null default now(),
++  check (from_user_id <> to_user_id)
++);
+diff --git a/migrations/down/002_wallet_non_negative.sql b/migrations/down/002_wallet_non_negative.sql
+new file mode 100644
+index 0000000..8cbec44
+--- /dev/null
++++ b/migrations/down/002_wallet_non_negative.sql
+@@ -0,0 +1 @@
++alter table wallets drop constraint if exists wallets_balance_non_negative;
+diff --git a/migrations/down/003_wallet_non_negative_validate.sql b/migrations/down/003_wallet_non_negative_validate.sql
+new file mode 100644
+index 0000000..243b1db
+--- /dev/null
++++ b/migrations/down/003_wallet_non_negative_validate.sql
+@@ -0,0 +1 @@
++-- Nothing to undo: validating a constraint only checks rows. The constraint itself is removed by down/002.
+diff --git a/migrations/down/004_transfers.sql b/migrations/down/004_transfers.sql
+new file mode 100644
+index 0000000..ad7743d
+--- /dev/null
++++ b/migrations/down/004_transfers.sql
+@@ -0,0 +1 @@
++drop table if exists transfers;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..3f4a69f 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,18 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    {
++      "name": "Send store credit",
++      "request": {
++        "method": "POST",
++        "url": "{{baseUrl}}/transfers",
++        "body": {
++          "mode": "raw",
++          "raw": "{\n  \"toUserId\": 2,\n  \"amountCents\": 500\n}",
++          "options": { "raw": { "language": "json" } }
++        }
++      }
++    }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..db45888 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -3,6 +3,9 @@ import { pool } from "./db.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
++// Largest value the integer money columns can hold.
++const MAX_CENTS = 2147483647;
++
+ declare global {
+   namespace Express {
+     interface Locals {
+@@ -52,7 +55,76 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.post("/transfers", async (req, res) => {
++    const body = req.body ?? {};
++    const toUserId = body.toUserId;
++    const amountCents = body.amountCents;
++    if (!Number.isSafeInteger(toUserId) || toUserId < 1) {
++      return sendError(res, 400, "invalid_recipient", "toUserId must be a positive integer");
++    }
++    if (!Number.isSafeInteger(amountCents) || amountCents < 1 || amountCents > MAX_CENTS) {
++      return sendError(res, 400, "invalid_amount", `amountCents must be an integer from 1 to ${MAX_CENTS}`);
++    }
++    const fromUserId = res.locals.user.id;
++    if (toUserId === fromUserId) return sendError(res, 400, "self_transfer", "Cannot send store credit to yourself");
++
++    const client = await pool.connect();
++    try {
++      await client.query("begin");
++      // Lock both users in id order, so two opposite transfers at the same time can't deadlock.
++      const { rows: locked } = await client.query(
++        "select id from users where id = any($1::int[]) order by id for update",
++        [[fromUserId, toUserId]],
++      );
++      if (locked.length !== 2) {
++        await client.query("rollback");
++        return sendError(res, 404, "recipient_not_found", "Recipient not found");
++      }
++      // The balance check is part of the write; the CHECK constraint on wallets is the last line of defence.
++      const { rows: debited } = await client.query(
++        "update wallets set balance_cents = balance_cents - $1 where user_id = $2 and balance_cents >= $1 returning balance_cents",
++        [amountCents, fromUserId],
++      );
++      if (debited.length === 0) {
++        await client.query("rollback");
++        return sendError(res, 409, "insufficient_funds", "Not enough store credit");
++      }
++      // Recipients may not have a wallet row yet.
++      await client.query(
++        `insert into wallets (user_id, balance_cents) values ($1, $2)
++         on conflict (user_id) do update set balance_cents = wallets.balance_cents + excluded.balance_cents`,
++        [toUserId, amountCents],
++      );
++      const { rows: [transfer] } = await client.query(
++        "insert into transfers (from_user_id, to_user_id, amount_cents) values ($1, $2, $3) returning id, created_at",
++        [fromUserId, toUserId, amountCents],
++      );
++      await client.query("commit");
++      res.status(201).json({
++        id: transfer.id,
++        fromUserId,
++        toUserId,
++        amountCents,
++        balanceCents: debited[0].balance_cents,
++        createdAt: transfer.created_at,
++      });
++    } catch (err) {
++      await client.query("rollback");
++      // The recipient's balance would exceed the integer column.
++      if ((err as { code?: string }).code === "22003") {
++        return sendError(res, 400, "amount_too_large", "Recipient balance would exceed the maximum");
++      }
++      throw err;
++    } finally {
++      client.release();
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
++    // A body that isn't valid JSON is the caller's mistake, not a server error.
++    if ((err as { type?: string }).type === "entity.parse.failed") {
++      return sendError(res, 400, "invalid_json", "Request body is not valid JSON");
++    }
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+   });
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..54de3fe 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,118 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++// Transfer tests run in order: each one starts from the balances the previous one left.
++const send = (token: string, body: unknown) =>
++  fetch(`${base}/transfers`, {
++    method: "POST",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: typeof body === "string" ? body : JSON.stringify(body),
++  });
++
++const balances = async () => {
++  const { rows } = await pool.query("select user_id, balance_cents from wallets order by user_id");
++  return Object.fromEntries(rows.map((r) => [r.user_id, r.balance_cents])) as Record<number, number>;
++};
++
++const transferCount = async () => (await pool.query("select count(*)::int as n from transfers")).rows[0].n;
++
++test("transfer moves store credit and writes a transfer row", async () => {
++  const res = await send("alice-token", { toUserId: 2, amountCents: 1500 });
++  assert.equal(res.status, 201);
++  const body = await res.json();
++  assert.equal(body.balanceCents, 8500);
++  assert.equal(body.toUserId, 2);
++  assert.deepEqual(await balances(), { 1: 8500, 2: 2000, 3: 0 });
++  assert.equal(await transferCount(), 1);
++});
++
++test("transfer larger than the balance is refused and changes nothing", async () => {
++  const res = await send("bob-token", { toUserId: 1, amountCents: 99999 });
++  assert.equal(res.status, 409);
++  assert.equal((await res.json()).error.code, "insufficient_funds");
++  assert.deepEqual(await balances(), { 1: 8500, 2: 2000, 3: 0 });
++  assert.equal(await transferCount(), 1);
++});
++
++test("bad transfer input is a 400 and changes nothing", async () => {
++  const bad = [
++    { toUserId: "2", amountCents: 100 },
++    { toUserId: 2.5, amountCents: 100 },
++    { toUserId: 0, amountCents: 100 },
++    { amountCents: 100 },
++    { toUserId: 2, amountCents: 0 },
++    { toUserId: 2, amountCents: -5 },
++    { toUserId: 2, amountCents: 1.5 },
++    { toUserId: 2, amountCents: "100" },
++    { toUserId: 2, amountCents: 2147483648 },
++    "{not json",
++  ];
++  for (const body of bad) {
++    const res = await send("alice-token", body);
++    assert.equal(res.status, 400, JSON.stringify(body));
++  }
++  assert.deepEqual(await balances(), { 1: 8500, 2: 2000, 3: 0 });
++});
++
++test("sending to yourself is a 400", async () => {
++  const res = await send("alice-token", { toUserId: 1, amountCents: 100 });
++  assert.equal(res.status, 400);
++  assert.equal((await res.json()).error.code, "self_transfer");
++});
++
++test("unknown recipient is a 404 and changes nothing", async () => {
++  const res = await send("alice-token", { toUserId: 999, amountCents: 100 });
++  assert.equal(res.status, 404);
++  assert.equal((await res.json()).error.code, "recipient_not_found");
++  assert.deepEqual(await balances(), { 1: 8500, 2: 2000, 3: 0 });
++});
++
++test("recipient without a wallet row gets one", async () => {
++  await pool.query(
++    "insert into users (email, name, api_token, password_hash) values ('carol@example.com', 'Carol', 'carol-token', 'unused')",
++  );
++  const { rows: [carol] } = await pool.query("select id from users where email = 'carol@example.com'");
++  const res = await send("alice-token", { toUserId: carol.id, amountCents: 100 });
++  assert.equal(res.status, 201);
++  assert.equal((await balances())[carol.id], 100);
++});
++
++test("opposite transfers at the same time all succeed and money is conserved", async () => {
++  const before = await balances();
++  const total = Object.values(before).reduce((a, b) => a + b, 0);
++  const results = await Promise.all([
++    ...Array.from({ length: 20 }, () => send("alice-token", { toUserId: 2, amountCents: 100 })),
++    ...Array.from({ length: 20 }, () => send("bob-token", { toUserId: 1, amountCents: 50 })),
++  ]);
++  assert.deepEqual(results.map((r) => r.status), Array(40).fill(201));
++  const after = await balances();
++  assert.equal(after[1], before[1] - 2000 + 1000);
++  assert.equal(after[2], before[2] + 2000 - 1000);
++  assert.equal(Object.values(after).reduce((a, b) => a + b, 0), total);
++});
++
++test("parallel transfers can't overdraw: exactly the affordable ones succeed", async () => {
++  const before = await balances();
++  const results = await Promise.all(
++    Array.from({ length: 100 }, () => send("alice-token", { toUserId: 2, amountCents: 100 })),
++  );
++  const statuses = results.map((r) => r.status);
++  const succeeded = statuses.filter((s) => s === 201).length;
++  assert.equal(succeeded, Math.floor(before[1] / 100));
++  assert.equal(statuses.filter((s) => s === 409).length, 100 - succeeded);
++  const after = await balances();
++  assert.equal(after[1], before[1] - succeeded * 100);
++  assert.ok(after[1] >= 0);
++});
++
++test("a credit that would overflow the recipient's balance is a 400 and changes nothing", async () => {
++  await pool.query("insert into users (email, name, api_token, password_hash) values ('dave@example.com', 'Dave', 'dave-token', 'unused')");
++  const { rows: [dave] } = await pool.query("select id from users where email = 'dave@example.com'");
++  await pool.query("insert into wallets (user_id, balance_cents) values ($1, 2147483000)", [dave.id]);
++  const before = await balances();
++  const res = await send("bob-token", { toUserId: dave.id, amountCents: 1000 });
++  assert.equal(res.status, 400);
++  assert.equal((await res.json()).error.code, "amount_too_large");
++  assert.deepEqual(await balances(), before);
++});

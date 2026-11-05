@@ -1,0 +1,110 @@
+<!doctype html>
+<!-- Source of docs/demo.gif. Each frame is this page with ?f=<slide><step>; build with scripts/demo-gif.sh.
+     Everything shown comes from bench/results/2026-11-04 (hidden-check output, Sonnet 5.5 + Haiku 5.5). -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  :root { --bg: #0d1117; --card: #161b22; --line: #30363d; --text: #e6edf3; --muted: #8b949e;
+          --red: #f85149; --green: #3fb950; --mono: "SF Mono", Menlo, monospace; }
+  * { box-sizing: border-box; margin: 0; }
+  html, body { width: 1280px; height: 720px; overflow: hidden; background: var(--bg); color: var(--text);
+               font-family: -apple-system, "SF Pro Display", "Helvetica Neue", sans-serif; }
+  section { display: none; height: 100%; padding: 52px 64px; flex-direction: column; }
+  section.on { display: flex; }
+  .top { display: flex; justify-content: space-between; color: var(--muted); font-size: 22px; }
+  .top b { color: var(--text); }
+  .label { color: var(--muted); font-size: 18px; letter-spacing: .08em; text-transform: uppercase; margin: 34px 0 10px; }
+  .prompt { font-family: var(--mono); font-size: 27px; line-height: 1.4; background: var(--card);
+            border: 1px solid var(--line); border-radius: 12px; padding: 18px 24px; }
+  .test { font-size: 30px; line-height: 1.3; font-weight: 600; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; margin-top: auto; }
+  .card { border: 2px dashed var(--line); border-radius: 16px; padding: 24px 28px; height: 268px;
+          display: flex; flex-direction: column; }
+  .card > * { visibility: hidden; }
+  .card.shown > * { visibility: visible; }
+  .card.bad.shown { border: 2px solid var(--red); background: #f8514914; }
+  .card.good.shown { border: 2px solid var(--green); background: #3fb95014; }
+  .who { font-size: 19px; letter-spacing: .08em; text-transform: uppercase; font-weight: 700; }
+  .bad .who, .bad .big { color: var(--red); }
+  .good .who, .good .big { color: var(--green); }
+  .big { font-size: 40px; font-weight: 800; margin-top: 14px; }
+  .why { font-size: 23px; line-height: 1.35; color: var(--text); margin-top: 10px; }
+  .runs { font-size: 19px; color: var(--muted); margin-top: auto; }
+
+  #c { justify-content: center; align-items: center; text-align: center; }
+  #c .sub { font-size: 26px; color: var(--muted); }
+  #c h1 { font-size: 34px; font-weight: 600; margin: 38px 0 18px; }
+  .nums { display: flex; gap: 72px; align-items: center; }
+  .num { font-size: 132px; font-weight: 800; line-height: 1; }
+  .num small { display: block; font-size: 24px; font-weight: 600; margin-top: 12px; color: var(--muted); }
+  .arrow { font-size: 72px; color: var(--muted); }
+  .install { font-family: var(--mono); font-size: 30px; background: var(--card); border: 1px solid var(--line);
+             border-radius: 12px; padding: 18px 32px; margin-top: 56px; }
+  .install span { color: var(--muted); }
+</style>
+</head>
+<body>
+
+<section id="a">
+  <div class="top"><span>Same prompt, same model, <b>without</b> and <b>with</b> backendskills</span><span>1 / 3</span></div>
+  <div class="label">The prompt</div>
+  <div class="prompt">Add POST /login so users can sign in with their email and password.</div>
+  <div class="label">Our test (the agent never sees it)</div>
+  <div class="test">Try 30 wrong passwords, then the right one.</div>
+  <div class="cards">
+    <div class="card bad" data-at="2">
+      <div class="who">Without skills</div>
+      <div class="big">✗ Still logs in</div>
+      <div class="why">Nothing stops password guessing.<br>50 guesses at once: 0 blocked.</div>
+      <div class="runs">Failed in 10 of 10 runs (Sonnet and Haiku)</div>
+    </div>
+    <div class="card good" data-at="3">
+      <div class="who">With backendskills</div>
+      <div class="big">✓ Blocked</div>
+      <div class="why">429 Too Many Requests,<br>even for 50 guesses at once.</div>
+      <div class="runs">Passed in 10 of 10 runs (Sonnet and Haiku)</div>
+    </div>
+  </div>
+</section>
+
+<section id="b">
+  <div class="top"><span>Same prompt, same model, <b>without</b> and <b>with</b> backendskills</span><span>2 / 3</span></div>
+  <div class="label">The prompt</div>
+  <div class="prompt">Rename orders.total_cents to orders.amount_cents, in the database and in the code.</div>
+  <div class="label">Our test (the agent never sees it)</div>
+  <div class="test">Deploy it while the old version is still running, like a rolling deploy.</div>
+  <div class="cards">
+    <div class="card bad" data-at="2">
+      <div class="who">Without skills</div>
+      <div class="big">✗ Old version crashes</div>
+      <div class="why">500 errors: the column it reads<br>is gone mid-deploy.</div>
+      <div class="runs">Failed in 10 of 10 runs (Sonnet and Haiku)</div>
+    </div>
+    <div class="card good" data-at="3">
+      <div class="who">With backendskills</div>
+      <div class="big">✓ Both versions work</div>
+      <div class="why">Adds the new column, keeps both in sync,<br>drops the old one in a later deploy.</div>
+      <div class="runs">Passed in 10 of 10 runs (Sonnet and Haiku)</div>
+    </div>
+  </div>
+</section>
+
+<section id="c">
+  <div class="sub">15 backend tasks · 300 runs · Claude Sonnet 5.5 and Haiku 5.5</div>
+  <h1>Runs with a critical mistake</h1>
+  <div class="nums">
+    <div class="num" style="color:var(--red)">25<small>without skills</small></div>
+    <div class="arrow">→</div>
+    <div class="num" style="color:var(--green)">2<small>with backendskills</small></div>
+  </div>
+  <div class="install"><span>$</span> npx skills add globalmpc/backendskills</div>
+</section>
+
+<script>
+  const f = new URLSearchParams(location.search).get("f") || "a3";
+  document.getElementById(f[0]).classList.add("on");
+  document.querySelectorAll(`#${f[0]} [data-at]`).forEach((el) => el.classList.toggle("shown", +f[1] >= +el.dataset.at));
+</script>
+</body>
+</html>

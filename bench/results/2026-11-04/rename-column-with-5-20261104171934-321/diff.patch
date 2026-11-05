@@ -1,0 +1,68 @@
+diff --git a/db/seed.sql b/db/seed.sql
+index 26e5d14..6d661c2 100644
+--- a/db/seed.sql
++++ b/db/seed.sql
+@@ -9,7 +9,7 @@ insert into products (name, price_cents, stock) values
+   ('Mug', 1200, 40),
+   ('Limited sneaker', 15000, 5);
+ 
+-insert into orders (user_id, status, total_cents, payment_id) values
++insert into orders (user_id, status, amount_cents, payment_id) values
+   (1, 'paid', 4000, 'pay_seed_1'),
+   (1, 'paid', 15000, 'pay_seed_2'),
+   (2, 'paid', 1200, 'pay_seed_3');
+diff --git a/migrations/002_orders_amount_cents.sql b/migrations/002_orders_amount_cents.sql
+new file mode 100644
+index 0000000..66178fd
+--- /dev/null
++++ b/migrations/002_orders_amount_cents.sql
+@@ -0,0 +1,26 @@
++-- Expand step of renaming orders.total_cents to orders.amount_cents.
++-- total_cents is kept until no running version reads it (drop it in a later deploy).
++set lock_timeout = '5s';
++
++alter table orders add column amount_cents integer;
++
++-- Keeps the two columns equal for every write, so the previous app version (which still
++-- reads and writes total_cents) and the new one (amount_cents) both see correct data.
++create function orders_sync_amount() returns trigger language plpgsql as $$
++begin
++  if tg_op = 'INSERT' then
++    new.amount_cents := coalesce(new.amount_cents, new.total_cents);
++    new.total_cents := coalesce(new.total_cents, new.amount_cents);
++  elsif new.total_cents is distinct from old.total_cents then
++    new.amount_cents := new.total_cents;
++  elsif new.amount_cents is distinct from old.amount_cents then
++    new.total_cents := new.amount_cents;
++  end if;
++  return new;
++end $$;
++
++create trigger orders_sync_amount before insert or update on orders
++  for each row execute function orders_sync_amount();
++
++-- One statement is fine for this table's size. If orders can grow large, move this to a batched job (see the db-migration skill, rule 4).
++update orders set amount_cents = total_cents where amount_cents is null;
+diff --git a/migrations/down/002_orders_amount_cents.sql b/migrations/down/002_orders_amount_cents.sql
+new file mode 100644
+index 0000000..ab2bd3e
+--- /dev/null
++++ b/migrations/down/002_orders_amount_cents.sql
+@@ -0,0 +1,3 @@
++drop trigger if exists orders_sync_amount on orders;
++drop function if exists orders_sync_amount();
++alter table orders drop column if exists amount_cents;
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..a1ac829 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -46,7 +46,8 @@ export function createApp() {
+ 
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+-      "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
++      // The JSON key stays total_cents: it is part of the public API response.
++      "select id, status, amount_cents as total_cents, created_at from orders where user_id = $1 order by id",
+       [res.locals.user.id],
+     );
+     res.json(rows);

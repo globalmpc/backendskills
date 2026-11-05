@@ -1,0 +1,168 @@
+diff --git a/migrations/002_orders_user_newest_idx.sql b/migrations/002_orders_user_newest_idx.sql
+new file mode 100644
+index 0000000..1a62bad
+--- /dev/null
++++ b/migrations/002_orders_user_newest_idx.sql
+@@ -0,0 +1,3 @@
++-- Keeps GET /orders pages on one user's orders an index scan, newest first.
++-- Alone in its file: CONCURRENTLY can't run inside a transaction.
++create index concurrently if not exists orders_user_newest_idx on orders (user_id, created_at desc, id desc);
+diff --git a/migrations/down/002_orders_user_newest_idx.sql b/migrations/down/002_orders_user_newest_idx.sql
+new file mode 100644
+index 0000000..a07047e
+--- /dev/null
++++ b/migrations/down/002_orders_user_newest_idx.sql
+@@ -0,0 +1 @@
++drop index concurrently if exists orders_user_newest_idx;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..b0a5bfb 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,7 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "List my orders (next page)", "request": { "method": "GET", "url": "{{baseUrl}}/orders?cursor={{nextCursor}}" } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..dafa428 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -25,6 +25,37 @@ async function auth(req: Request, res: Response, next: NextFunction) {
+   next();
+ }
+ 
++const ORDERS_PAGE_SIZE = 20;
++
++type OrderRow = { id: number; status: string; total_cents: number; created_at: Date; cursor_at: string };
++type OrderCursor = { at: string; id: number };
++
++// Opaque to clients. `at` is the last row's created_at as Postgres text, which keeps microseconds;
++// a JS Date would drop them and skip or repeat rows that share a millisecond.
++function encodeCursor(cursor: OrderCursor): string {
++  return Buffer.from(JSON.stringify(cursor)).toString("base64url");
++}
++
++function decodeCursor(raw: string): OrderCursor | null {
++  try {
++    const value = JSON.parse(Buffer.from(raw, "base64url").toString("utf8"));
++    const valid =
++      typeof value?.at === "string" &&
++      Number.isInteger(value?.id) &&
++      value.id > 0 &&
++      value.id <= 2147483647;
++    return valid ? { at: value.at, id: value.id } : null;
++  } catch {
++    return null;
++  }
++}
++
++// Postgres: invalid_datetime_format, datetime_field_overflow, numeric_value_out_of_range
++function isInvalidInputError(err: unknown): boolean {
++  const code = (err as { code?: unknown })?.code;
++  return code === "22007" || code === "22008" || code === "22003";
++}
++
+ export function createApp() {
+   const app = express();
+   app.use(express.json());
+@@ -44,12 +75,35 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
+-  app.get("/orders", async (_req, res) => {
+-    const { rows } = await pool.query(
+-      "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
+-      [res.locals.user.id],
+-    );
+-    res.json(rows);
++  app.get("/orders", async (req, res) => {
++    let cursor: OrderCursor | null = null;
++    if (req.query.cursor !== undefined) {
++      cursor = typeof req.query.cursor === "string" ? decodeCursor(req.query.cursor) : null;
++      if (cursor === null) return sendError(res, 400, "invalid_cursor", "Invalid cursor");
++    }
++
++    // Fetch one extra row to learn whether a next page exists.
++    let rows: OrderRow[];
++    try {
++      ({ rows } = await pool.query<OrderRow>(
++        `select id, status, total_cents, created_at, created_at::text as cursor_at
++           from orders
++          where user_id = $1
++            and ($2::timestamptz is null or (created_at, id) < ($2::timestamptz, $3::int))
++          order by created_at desc, id desc
++          limit $4`,
++        [res.locals.user.id, cursor?.at ?? null, cursor?.id ?? null, ORDERS_PAGE_SIZE + 1],
++      ));
++    } catch (err) {
++      // A cursor that decodes but holds a bad timestamp or id is the client's mistake, not ours.
++      if (isInvalidInputError(err)) return sendError(res, 400, "invalid_cursor", "Invalid cursor");
++      throw err;
++    }
++
++    const page = rows.slice(0, ORDERS_PAGE_SIZE);
++    const last = page[page.length - 1];
++    const nextCursor = rows.length > ORDERS_PAGE_SIZE && last ? encodeCursor({ at: last.cursor_at, id: last.id }) : null;
++    res.json({ orders: page.map(({ cursor_at: _cursorAt, ...order }) => order), nextCursor });
+   });
+ 
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..af488e5 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -46,8 +46,48 @@ test("/me returns the caller", async () => {
+ test("/orders lists only the caller's orders", async () => {
+   const alice = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
+   const bob = await (await fetch(`${base}/orders`, { headers: as("bob-token") })).json();
+-  assert.equal(alice.length, 2);
+-  assert.equal(bob.length, 1);
++  assert.equal(alice.orders.length, 2);
++  assert.equal(bob.orders.length, 1);
++  assert.equal(alice.nextCursor, null);
++});
++
++test("/orders with a bad cursor is a 400 in the standard error format", async () => {
++  for (const cursor of ["not-base64-json", Buffer.from('{"at":"nope","id":1}').toString("base64url"), Buffer.from('{"at":"2026-01-01 00:00:00+00","id":1e99}').toString("base64url")]) {
++    const res = await fetch(`${base}/orders?cursor=${encodeURIComponent(cursor)}`, { headers: as("alice-token") });
++    assert.equal(res.status, 400, cursor);
++    assert.deepEqual(await res.json(), { error: { code: "invalid_cursor", message: "Invalid cursor" } });
++  }
++});
++
++test("/orders pages through all of a user's orders, newest first, 20 per page", async () => {
++  // A fresh user with 45 orders. Created in pairs with the same timestamp, so the id tie-break is exercised.
++  const { rows: [carol] } = await pool.query<{ id: number }>(
++    "insert into users (email, name, api_token, password_hash) values ('carol@example.com', 'Carol', 'carol-token', 'x') returning id",
++  );
++  await pool.query(
++    "insert into orders (user_id, status, total_cents, created_at) select $1, 'paid', 100, now() - (g / 2) * interval '1 minute' from generate_series(1, 45) g",
++    [carol.id],
++  );
++  const { rows: expected } = await pool.query<{ id: number }>(
++    "select id from orders where user_id = $1 order by created_at desc, id desc", [carol.id],
++  );
++
++  const seen: number[] = [];
++  let cursor: string | null = null;
++  let pages = 0;
++  do {
++    const url: string = `${base}/orders${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`;
++    const body: { orders: { id: number }[]; nextCursor: string | null } = await (await fetch(url, { headers: as("carol-token") })).json();
++    assert.ok(body.orders.length <= 20);
++    if (body.nextCursor !== null) assert.equal(body.orders.length, 20);
++    seen.push(...body.orders.map((o) => o.id));
++    cursor = body.nextCursor;
++    pages++;
++  } while (cursor !== null);
++
++  assert.equal(pages, 3);
++  assert.deepEqual(seen, expected.map((r) => r.id));
++  assert.equal(new Set(seen).size, 45);
+ });
+ 
+ test("/products lists products with stock", async () => {

@@ -1,0 +1,54 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..8710e62 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -46,7 +46,24 @@ export function createApp() {
+ 
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+-      "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
++      `select o.id, o.status, o.total_cents, o.created_at,
++        coalesce(
++          json_agg(
++            json_build_object(
++              'product_id', oi.product_id,
++              'product_name', p.name,
++              'quantity', oi.quantity,
++              'price_cents', oi.price_cents
++            ) order by oi.product_id
++          ) filter (where oi.order_id is not null),
++          '[]'::json
++        ) as items
++      from orders o
++      left join order_items oi on oi.order_id = o.id
++      left join products p on p.id = oi.product_id
++      where o.user_id = $1
++      group by o.id
++      order by o.id`,
+       [res.locals.user.id],
+     );
+     res.json(rows);
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..6ad28ba 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -50,6 +50,19 @@ test("/orders lists only the caller's orders", async () => {
+   assert.equal(bob.length, 1);
+ });
+ 
++test("/orders includes items with product name, quantity and price", async () => {
++  const orders = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
++  for (const o of orders) {
++    assert.ok(Array.isArray(o.items));
++    for (const i of o.items) {
++      assert.equal(typeof i.product_id, "number");
++      assert.equal(typeof i.product_name, "string");
++      assert.equal(typeof i.quantity, "number");
++      assert.equal(typeof i.price_cents, "number");
++    }
++  }
++});
++
+ test("/products lists products with stock", async () => {
+   const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
+   assert.equal(products.length, 3);

@@ -1,0 +1,33 @@
+diff --git a/migrations/002_orders_total_nonneg.sql b/migrations/002_orders_total_nonneg.sql
+new file mode 100644
+index 0000000..157507c
+--- /dev/null
++++ b/migrations/002_orders_total_nonneg.sql
+@@ -0,0 +1,3 @@
++-- not valid: enforced for new writes immediately, existing rows are checked in 003
++set local lock_timeout = '5s';
++alter table orders add constraint orders_total_cents_nonneg check (total_cents >= 0) not valid;
+diff --git a/migrations/003_orders_total_nonneg_validate.sql b/migrations/003_orders_total_nonneg_validate.sql
+new file mode 100644
+index 0000000..3991091
+--- /dev/null
++++ b/migrations/003_orders_total_nonneg_validate.sql
+@@ -0,0 +1,2 @@
++-- validation scans the table but does not block writes
++alter table orders validate constraint orders_total_cents_nonneg;
+diff --git a/migrations/down/002_orders_total_nonneg.sql b/migrations/down/002_orders_total_nonneg.sql
+new file mode 100644
+index 0000000..c7c96db
+--- /dev/null
++++ b/migrations/down/002_orders_total_nonneg.sql
+@@ -0,0 +1,2 @@
++set local lock_timeout = '5s';
++alter table orders drop constraint if exists orders_total_cents_nonneg;
+diff --git a/migrations/down/003_orders_total_nonneg_validate.sql b/migrations/down/003_orders_total_nonneg_validate.sql
+new file mode 100644
+index 0000000..b5687dd
+--- /dev/null
++++ b/migrations/down/003_orders_total_nonneg_validate.sql
+@@ -0,0 +1,2 @@
++-- Validation can't be undone on its own; the constraint is dropped by the down of 002.
++select 1;

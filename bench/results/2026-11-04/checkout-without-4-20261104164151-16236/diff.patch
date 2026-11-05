@@ -1,0 +1,192 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..a5dadb7 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { payments } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -15,6 +16,38 @@ export function sendError(res: Response, status: number, code: string, message:
+   res.status(status).json({ error: { code, message } });
+ }
+ 
++class OrderError extends Error {
++  constructor(
++    readonly status: number,
++    readonly code: string,
++    message: string,
++  ) {
++    super(message);
++  }
++}
++
++type OrderLineInput = { productId: number; quantity: number };
++
++function isPositiveInt(value: unknown): value is number {
++  return Number.isInteger(value) && (value as number) > 0;
++}
++
++// Returns null unless the body is { items: [{ productId, quantity }] } with at least one item,
++// positive integer values, and no product listed twice.
++function parseOrderItems(body: unknown): OrderLineInput[] | null {
++  const items = (body as { items?: unknown } | undefined)?.items;
++  if (!Array.isArray(items) || items.length === 0) return null;
++  const parsed: OrderLineInput[] = [];
++  for (const item of items as ({ productId?: unknown; quantity?: unknown } | null)[]) {
++    const productId = item?.productId;
++    const quantity = item?.quantity;
++    if (!isPositiveInt(productId) || !isPositiveInt(quantity)) return null;
++    parsed.push({ productId, quantity });
++  }
++  if (new Set(parsed.map((i) => i.productId)).size !== parsed.length) return null;
++  return parsed;
++}
++
+ async function auth(req: Request, res: Response, next: NextFunction) {
+   const token = req.headers.authorization?.replace(/^Bearer /, "");
+   const { rows } = token
+@@ -52,6 +85,77 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  // Everything happens in one transaction. Products are locked (FOR UPDATE) so two orders cannot both
++  // see the same stock. The payment is charged inside the transaction with a key derived from the order id,
++  // so the order can only be charged once; if anything fails, the transaction rolls back and stock is left unchanged.
++  app.post("/orders", async (req, res) => {
++    const items = parseOrderItems(req.body);
++    if (!items) {
++      return sendError(
++        res,
++        400,
++        "invalid_body",
++        "Body must be { items: [{ productId, quantity }] } with at least one item, positive integers, and no repeated productId",
++      );
++    }
++    const userId = res.locals.user.id;
++    const client = await pool.connect();
++    try {
++      await client.query("begin");
++
++      const { rows: products } = await client.query<{ id: number; price_cents: number; stock: number }>(
++        "select id, price_cents, stock from products where id = any($1::int[]) order by id for update",
++        [items.map((i) => i.productId)],
++      );
++      const byId = new Map(products.map((p) => [p.id, p]));
++      const lines = items.map(({ productId, quantity }) => {
++        const product = byId.get(productId);
++        if (!product) throw new OrderError(400, "unknown_product", `Product ${productId} does not exist`);
++        if (product.stock < quantity) {
++          throw new OrderError(409, "insufficient_stock", `Not enough stock for product ${productId}`);
++        }
++        return { productId, quantity, priceCents: product.price_cents };
++      });
++      const totalCents = lines.reduce((sum, l) => sum + l.priceCents * l.quantity, 0);
++
++      const {
++        rows: [order],
++      } = await client.query<{ id: number; created_at: Date }>(
++        "insert into orders (user_id, status, total_cents) values ($1, 'pending', $2) returning id, created_at",
++        [userId, totalCents],
++      );
++      for (const line of lines) {
++        await client.query(
++          "insert into order_items (order_id, product_id, quantity, price_cents) values ($1, $2, $3, $4)",
++          [order.id, line.productId, line.quantity, line.priceCents],
++        );
++        await client.query("update products set stock = stock - $1 where id = $2", [line.quantity, line.productId]);
++      }
++
++      const { paymentId } = await payments.charge({
++        amountCents: totalCents,
++        idempotencyKey: `order-${order.id}`,
++      });
++      await client.query("update orders set status = 'paid', payment_id = $2 where id = $1", [order.id, paymentId]);
++      await client.query("commit");
++
++      res.status(201).json({
++        id: order.id,
++        status: "paid",
++        total_cents: totalCents,
++        payment_id: paymentId,
++        created_at: order.created_at,
++        items: lines.map((l) => ({ product_id: l.productId, quantity: l.quantity, price_cents: l.priceCents })),
++      });
++    } catch (err) {
++      await client.query("rollback");
++      if (err instanceof OrderError) return sendError(res, err.status, err.code, err.message);
++      throw err;
++    } finally {
++      client.release();
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..3b88efb 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,59 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const post = (token: string, body: unknown) =>
++  fetch(`${base}/orders`, {
++    method: "POST",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("POST /orders charges the total, reduces stock and returns the order", async () => {
++  const res = await post("alice-token", { items: [{ productId: 1, quantity: 2 }, { productId: 2, quantity: 1 }] });
++  assert.equal(res.status, 201);
++  const order = await res.json();
++  assert.equal(order.status, "paid");
++  assert.equal(order.total_cents, 2 * 2000 + 1200);
++  assert.equal(order.items.length, 2);
++  const { rows: [payment] } = await pool.query("select amount_cents from payment_calls where payment_id = $1", [order.payment_id]);
++  assert.equal(payment.amount_cents, 5200);
++  const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
++  assert.equal(products.find((p: { id: number }) => p.id === 1).stock, 98);
++  assert.equal(products.find((p: { id: number }) => p.id === 2).stock, 39);
++});
++
++test("POST /orders with insufficient stock returns 409 and changes nothing", async () => {
++  const productsBefore = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
++  const ordersBefore = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
++  const res = await post("alice-token", { items: [{ productId: 1, quantity: 1 }, { productId: 3, quantity: 6 }] });
++  assert.equal(res.status, 409);
++  assert.equal((await res.json()).error.code, "insufficient_stock");
++  const productsAfter = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
++  assert.deepEqual(productsAfter, productsBefore);
++  const ordersAfter = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
++  assert.equal(ordersAfter.length, ordersBefore.length);
++});
++
++test("POST /orders rejects malformed bodies and unknown products", async () => {
++  const malformed = [
++    {},
++    { items: [] },
++    { items: [{ productId: 1, quantity: 0 }] },
++    { items: [{ productId: "1", quantity: 1 }] },
++    { items: [{ productId: 1, quantity: 1 }, { productId: 1, quantity: 1 }] },
++  ];
++  for (const body of malformed) {
++    const res = await post("alice-token", body);
++    assert.equal(res.status, 400);
++    assert.equal((await res.json()).error.code, "invalid_body");
++  }
++  const res = await post("alice-token", { items: [{ productId: 999, quantity: 1 }] });
++  assert.equal(res.status, 400);
++  assert.equal((await res.json()).error.code, "unknown_product");
++});
++
++test("POST /orders requires a valid token", async () => {
++  const res = await post("nope", { items: [{ productId: 1, quantity: 1 }] });
++  assert.equal(res.status, 401);
++});

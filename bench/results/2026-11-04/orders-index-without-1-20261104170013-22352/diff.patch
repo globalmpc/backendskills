@@ -1,0 +1,11 @@
+diff --git a/migrations/002_orders_user_id_index.sql b/migrations/002_orders_user_id_index.sql
+new file mode 100644
+index 0000000..a7741ce
+--- /dev/null
++++ b/migrations/002_orders_user_id_index.sql
+@@ -0,0 +1,5 @@
++-- Index for looking up a user's orders (GET /orders). Postgres does not index foreign keys automatically.
++-- CONCURRENTLY avoids blocking writes to the large orders table while the index builds.
++-- This file must contain only this one statement: CONCURRENTLY cannot run inside a transaction block,
++-- and the migrate runner sends each file as a single query.
++create index concurrently if not exists orders_user_id_idx on orders (user_id);

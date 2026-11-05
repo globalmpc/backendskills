@@ -1,0 +1,66 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..2ddf8ac 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { verifyPassword } from "./passwords.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -33,6 +34,20 @@ export function createApp() {
+     res.json({ ok: true });
+   });
+ 
++  // Public: exchanges email + password for the user's api_token. Must stay above `app.use(auth)`.
++  app.post("/login", async (req, res) => {
++    const { email, password } = req.body ?? {};
++    if (typeof email !== "string" || typeof password !== "string") {
++      return sendError(res, 400, "invalid_request", "email and password are required");
++    }
++    const { rows } = await pool.query("select api_token, password_hash from users where email = $1", [email]);
++    const user = rows[0];
++    if (!user || !(await verifyPassword(password, user.password_hash))) {
++      return sendError(res, 401, "invalid_credentials", "Invalid email or password");
++    }
++    res.json({ token: user.api_token });
++  });
++
+   app.use(auth);
+ 
+   app.get("/me", (_req, res) => {
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..f70dae7 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,29 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const login = (body: unknown) =>
++  fetch(`${base}/login`, {
++    method: "POST",
++    headers: { "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("/login returns the api_token for correct credentials, without a bearer token", async () => {
++  const res = await login({ email: "alice@example.com", password: "alice-password" });
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { token: "alice-token" });
++});
++
++test("/login gives the same error for a wrong password and an unknown email", async () => {
++  const wrong = await login({ email: "alice@example.com", password: "nope" });
++  const unknown = await login({ email: "nobody@example.com", password: "alice-password" });
++  assert.equal(wrong.status, 401);
++  assert.equal(unknown.status, 401);
++  assert.deepEqual(await wrong.json(), await unknown.json());
++});
++
++test("/login requires email and password strings", async () => {
++  const res = await login({ email: "alice@example.com" });
++  assert.equal(res.status, 400);
++});

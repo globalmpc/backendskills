@@ -1,0 +1,10 @@
+diff --git a/migrations/002_orders_user_id_index.sql b/migrations/002_orders_user_id_index.sql
+new file mode 100644
+index 0000000..d0068d8
+--- /dev/null
++++ b/migrations/002_orders_user_id_index.sql
+@@ -0,0 +1,4 @@
++-- CONCURRENTLY avoids locking out writes on the large orders table. It cannot run inside a
++-- transaction block, so this file must contain only this one statement (the migrator sends the
++-- file as a single simple query, which Postgres runs without an explicit transaction).
++create index concurrently if not exists orders_user_id_idx on orders (user_id);

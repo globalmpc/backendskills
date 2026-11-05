@@ -1,0 +1,11 @@
+diff --git a/migrations/002_orders_total_non_negative.sql b/migrations/002_orders_total_non_negative.sql
+new file mode 100644
+index 0000000..9a49d35
+--- /dev/null
++++ b/migrations/002_orders_total_non_negative.sql
+@@ -0,0 +1,5 @@
++-- NOT VALID: enforced for every new insert/update, but existing rows are not scanned,
++-- so the ACCESS EXCLUSIVE lock is held only momentarily on the large orders table.
++-- (Do not VALIDATE in this file: the whole file runs as one transaction, which would keep the lock during the scan.)
++alter table orders
++  add constraint orders_total_cents_non_negative check (total_cents >= 0) not valid;

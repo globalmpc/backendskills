@@ -1,0 +1,99 @@
+diff --git a/migrations/002_product_discount.sql b/migrations/002_product_discount.sql
+new file mode 100644
+index 0000000..c688948
+--- /dev/null
++++ b/migrations/002_product_discount.sql
+@@ -0,0 +1,4 @@
++-- Percentage off the list price (0 = no discount). Old app versions ignore this column,
++-- and the default means existing rows and inserts that omit it stay valid during rolling deploys.
++alter table products
++  add column discount_percent integer not null default 0 check (discount_percent between 0 and 100);
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..63daf54 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -40,10 +40,25 @@ export function createApp() {
+   });
+ 
+   app.get("/products", async (_req, res) => {
+-    const { rows } = await pool.query("select id, name, price_cents, stock from products order by id");
++    const { rows } = await pool.query("select id, name, price_cents, stock, discount_percent from products order by id");
+     res.json(rows);
+   });
+ 
++  app.patch("/products/:id", async (req, res) => {
++    if (res.locals.user.role !== "admin") return sendError(res, 403, "forbidden", "Admins only");
++    if (!/^\d{1,9}$/.test(req.params.id)) return sendError(res, 404, "not_found", "Product not found");
++    const discount = req.body?.discountPercent;
++    if (!Number.isInteger(discount) || discount < 0 || discount > 100) {
++      return sendError(res, 400, "validation_error", "discountPercent must be a whole number from 0 to 100");
++    }
++    const { rows } = await pool.query(
++      "update products set discount_percent = $1 where id = $2 returning id, name, price_cents, stock, discount_percent",
++      [discount, Number(req.params.id)],
++    );
++    if (rows.length === 0) return sendError(res, 404, "not_found", "Product not found");
++    res.json(rows[0]);
++  });
++
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+       "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..c257c20 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -56,6 +56,53 @@ test("/products lists products with stock", async () => {
+   assert.equal(products.find((p: { name: string }) => p.name === "Limited sneaker").stock, 5);
+ });
+ 
++test("only admins can set a product discount", async () => {
++  const id = (await (await fetch(`${base}/products`, { headers: as("alice-token") })).json())[0].id;
++  const body = JSON.stringify({ discountPercent: 10 });
++  const denied = await fetch(`${base}/products/${id}`, { method: "PATCH", headers: { ...as("alice-token"), "content-type": "application/json" }, body });
++  assert.equal(denied.status, 403);
++  const { rows } = await pool.query("select discount_percent from products where id = $1", [id]);
++  assert.equal(rows[0].discount_percent, 0);
++});
++
++test("admin sets a discount; it shows up in the product list", async () => {
++  const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
++  const id = products[0].id;
++  const res = await fetch(`${base}/products/${id}`, {
++    method: "PATCH",
++    headers: { ...as("admin-token"), "content-type": "application/json" },
++    body: JSON.stringify({ discountPercent: 25 }),
++  });
++  assert.equal(res.status, 200);
++  assert.equal((await res.json()).discount_percent, 25);
++  const after = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
++  assert.equal(after.find((p: { id: number }) => p.id === id).discount_percent, 25);
++});
++
++test("discountPercent must be a whole number from 0 to 100", async () => {
++  const id = (await (await fetch(`${base}/products`, { headers: as("alice-token") })).json())[0].id;
++  for (const bad of [101, -1, 1.5, "10", null]) {
++    const res = await fetch(`${base}/products/${id}`, {
++      method: "PATCH",
++      headers: { ...as("admin-token"), "content-type": "application/json" },
++      body: JSON.stringify({ discountPercent: bad }),
++    });
++    assert.equal(res.status, 400, `expected 400 for ${JSON.stringify(bad)}`);
++    assert.equal((await res.json()).error.code, "validation_error");
++  }
++  const { rows } = await pool.query("select discount_percent from products where id = $1", [id]);
++  assert.equal(rows[0].discount_percent, 25);
++});
++
++test("discount on an unknown product is 404", async () => {
++  const res = await fetch(`${base}/products/999999`, {
++    method: "PATCH",
++    headers: { ...as("admin-token"), "content-type": "application/json" },
++    body: JSON.stringify({ discountPercent: 5 }),
++  });
++  assert.equal(res.status, 404);
++});
++
+ test("payments client records every call; the same idempotency key is charged once", async () => {
+   const first = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });
+   const again = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });

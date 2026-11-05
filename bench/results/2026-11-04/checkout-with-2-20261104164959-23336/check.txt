@@ -1,0 +1,14 @@
+✔ an order for an item in stock works (103.80075ms)
+✔ 20 buyers at once for 5 sneakers: 5 orders, 5 charges, stock never below 0 (81.441917ms)
+✔ a negative quantity is rejected and nothing changes (2.739ms)
+✔ orders for the same two products in opposite order, at once, all go through (no deadlock) (208.841791ms)
+✔ the same product twice in one order is handled, not a server error (61.571208ms)
+✔ if the payment provider is down, the order fails and the stock comes back (84.980708ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 744.102083

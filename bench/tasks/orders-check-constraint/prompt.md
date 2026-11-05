@@ -1,0 +1,1 @@
+A bug let a few orders through with a negative `total_cents`. That bug is fixed, but we want the database itself to refuse an order with a negative total from now on. The orders table is large in production. The existing rows are all fine.

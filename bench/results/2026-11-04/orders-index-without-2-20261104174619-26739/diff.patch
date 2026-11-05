@@ -1,0 +1,9 @@
+diff --git a/migrations/002_orders_user_id_index.sql b/migrations/002_orders_user_id_index.sql
+new file mode 100644
+index 0000000..b9d50ef
+--- /dev/null
++++ b/migrations/002_orders_user_id_index.sql
+@@ -0,0 +1,3 @@
++-- CONCURRENTLY avoids blocking writes to the large orders table. It cannot run in a transaction
++-- block, so this file must contain only this single statement (the runner sends it as one query).
++create index concurrently if not exists orders_user_id_idx on orders (user_id);

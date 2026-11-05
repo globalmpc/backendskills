@@ -1,0 +1,37 @@
+✔ an order for an item in stock works (96.2725ms)
+✔ 20 buyers at once for 5 sneakers: 5 orders, 5 charges, stock never below 0 (78.642625ms)
+✔ a negative quantity is rejected and nothing changes (1.753917ms)
+✔ orders for the same two products in opposite order, at once, all go through (no deadlock) (198.866583ms)
+✔ the same product twice in one order is handled, not a server error (59.723084ms)
+error: payment provider unavailable
+    at /private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-cb9aWs/app/node_modules/.pnpm/pg-pool@3.14.0_pg@8.23.1/node_modules/pg-pool/index.js:45:11
+    at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+    at async call (/private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-cb9aWs/app/src/payments.ts:15:22)
+    at async <anonymous> (/private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-cb9aWs/app/src/app.ts:160:24) {
+  length: 147,
+  severity: 'ERROR',
+  code: 'P0001',
+  detail: undefined,
+  hint: undefined,
+  position: undefined,
+  internalPosition: undefined,
+  internalQuery: undefined,
+  where: 'PL/pgSQL function bench_provider_down() line 2 at RAISE',
+  schema: undefined,
+  table: undefined,
+  column: undefined,
+  dataType: undefined,
+  constraint: undefined,
+  file: 'pl_exec.c',
+  line: '3897',
+  routine: 'exec_stmt_raise'
+}
+✔ if the payment provider is down, the order fails and the stock comes back (80.447042ms)
+ℹ tests 6
+ℹ suites 0
+ℹ pass 6
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 658.919209

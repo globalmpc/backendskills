@@ -1,0 +1,43 @@
+diff --git a/migrations/002_orders_total_nonnegative.sql b/migrations/002_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..ab88bd3
+--- /dev/null
++++ b/migrations/002_orders_total_nonnegative.sql
+@@ -0,0 +1,8 @@
++-- Reject negative order totals. NOT VALID means Postgres enforces the check on every
++-- new or updated row right away without scanning existing rows, so this statement only
++-- takes a brief ACCESS EXCLUSIVE lock. lock_timeout makes it give up instead of queueing
++-- behind a long transaction, which would block all traffic on orders while it waits.
++-- Existing rows are checked by 003_validate_orders_total_nonnegative.sql.
++set local lock_timeout = '5s';
++alter table orders
++  add constraint orders_total_cents_nonnegative check (total_cents >= 0) not valid;
+diff --git a/migrations/003_validate_orders_total_nonnegative.sql b/migrations/003_validate_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..d8ad8b3
+--- /dev/null
++++ b/migrations/003_validate_orders_total_nonnegative.sql
+@@ -0,0 +1,5 @@
++-- Check existing orders rows against orders_total_cents_nonnegative (added NOT VALID in 002).
++-- This runs in its own transaction on purpose: VALIDATE scans the table under
++-- SHARE UPDATE EXCLUSIVE, which does not block reads or writes. If it shared a transaction
++-- with 002, the ACCESS EXCLUSIVE lock from 002 would be held for the whole scan.
++alter table orders validate constraint orders_total_cents_nonnegative;
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..21ed4fa 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -56,6 +56,13 @@ test("/products lists products with stock", async () => {
+   assert.equal(products.find((p: { name: string }) => p.name === "Limited sneaker").stock, 5);
+ });
+ 
++test("the database refuses an order with a negative total", async () => {
++  await assert.rejects(
++    pool.query("insert into orders (user_id, total_cents) select id, -1 from users where email = 'alice@example.com'"),
++    { code: "23514" }, // check_violation
++  );
++});
++
+ test("payments client records every call; the same idempotency key is charged once", async () => {
+   const first = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });
+   const again = await payments.charge({ amountCents: 500, idempotencyKey: "k1" });

@@ -1,0 +1,1 @@
+Products can now be discounted. Add a `discount_percent` column to `products` (a whole number from 0 to 100, default 0), and `PATCH /products/:id` so admins can set it with `{ "discountPercent": number }`.

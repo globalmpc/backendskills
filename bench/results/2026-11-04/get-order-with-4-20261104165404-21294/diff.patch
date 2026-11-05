@@ -1,0 +1,82 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..f8dbb00 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,7 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "Get one of my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders/1" } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..1156108 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -52,6 +52,24 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.get("/orders/:id", async (req, res) => {
++    const id = req.params.id;
++    if (!/^\d+$/.test(id) || Number(id) < 1 || Number(id) > 2147483647) {
++      return sendError(res, 400, "invalid_id", "Order id must be a positive integer");
++    }
++    // Scoped to the caller: someone else's order looks the same as a missing one.
++    const { rows: [order] } = await pool.query(
++      "select id, status, total_cents, created_at from orders where id = $1 and user_id = $2",
++      [id, res.locals.user.id],
++    );
++    if (!order) return sendError(res, 404, "not_found", "Order not found");
++    const { rows: items } = await pool.query(
++      "select product_id, quantity, price_cents from order_items where order_id = $1 order by product_id",
++      [order.id],
++    );
++    res.json({ ...order, items });
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..38f2232 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -50,6 +50,35 @@ test("/orders lists only the caller's orders", async () => {
+   assert.equal(bob.length, 1);
+ });
+ 
++test("/orders/:id returns the caller's order with its items", async () => {
++  const res = await fetch(`${base}/orders/1`, { headers: as("alice-token") });
++  assert.equal(res.status, 200);
++  const order = await res.json();
++  assert.equal(order.id, 1);
++  assert.equal(order.status, "paid");
++  assert.equal(order.total_cents, 4000);
++  assert.deepEqual(order.items, [{ product_id: 1, quantity: 2, price_cents: 2000 }]);
++});
++
++test("/orders/:id hides another user's order behind 404", async () => {
++  const res = await fetch(`${base}/orders/3`, { headers: as("alice-token") });
++  assert.equal(res.status, 404);
++  assert.deepEqual(await res.json(), { error: { code: "not_found", message: "Order not found" } });
++});
++
++test("/orders/:id returns 404 for a missing order", async () => {
++  const res = await fetch(`${base}/orders/999999`, { headers: as("alice-token") });
++  assert.equal(res.status, 404);
++});
++
++test("/orders/:id rejects ids that are not positive integers in range with 400", async () => {
++  for (const id of ["abc", "1.5", "0", "-1", "99999999999"]) {
++    const res = await fetch(`${base}/orders/${id}`, { headers: as("alice-token") });
++    assert.equal(res.status, 400, `id ${id}`);
++    assert.equal((await res.json()).error.code, "invalid_id");
++  }
++});
++
+ test("/products lists products with stock", async () => {
+   const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
+   assert.equal(products.length, 3);

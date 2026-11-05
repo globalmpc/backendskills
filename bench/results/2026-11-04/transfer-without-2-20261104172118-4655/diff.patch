@@ -1,0 +1,112 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..3beece3 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -52,6 +52,52 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  // Moves store credit from the caller's wallet to another user's wallet in one transaction.
++  // Both wallet rows are locked in user_id order so concurrent transfers cannot deadlock.
++  app.post("/transfers", async (req, res) => {
++    const { toUserId, amountCents } = req.body ?? {};
++    if (!Number.isInteger(toUserId) || !Number.isInteger(amountCents) || amountCents <= 0) {
++      return sendError(res, 400, "invalid_body", "toUserId must be an integer and amountCents a positive integer");
++    }
++    const fromUserId = res.locals.user.id;
++    if (toUserId === fromUserId) {
++      return sendError(res, 400, "invalid_transfer", "Cannot transfer to yourself");
++    }
++
++    const client = await pool.connect();
++    try {
++      await client.query("begin");
++      const { rows } = await client.query(
++        "select user_id, balance_cents from wallets where user_id in ($1, $2) order by user_id for update",
++        [fromUserId, toUserId],
++      );
++      const sender = rows.find((r) => r.user_id === fromUserId);
++      const recipient = rows.find((r) => r.user_id === toUserId);
++      if (!recipient) {
++        await client.query("rollback");
++        return sendError(res, 404, "recipient_not_found", "Recipient has no wallet");
++      }
++      if (sender.balance_cents < amountCents) {
++        await client.query("rollback");
++        return sendError(res, 422, "insufficient_funds", "Not enough store credit");
++      }
++      await client.query("update wallets set balance_cents = balance_cents - $2 where user_id = $1", [fromUserId, amountCents]);
++      await client.query("update wallets set balance_cents = balance_cents + $2 where user_id = $1", [toUserId, amountCents]);
++      await client.query("commit");
++      res.status(201).json({
++        fromUserId,
++        toUserId,
++        amountCents,
++        balanceCents: sender.balance_cents - amountCents,
++      });
++    } catch (err) {
++      await client.query("rollback").catch(() => {});
++      throw err;
++    } finally {
++      client.release();
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..e54660c 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,50 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const post = (token: string, body: unknown) =>
++  fetch(`${base}/transfers`, {
++    method: "POST",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++const balances = async () => {
++  const { rows } = await pool.query("select user_id, balance_cents from wallets order by user_id");
++  return Object.fromEntries(rows.map((r) => [r.user_id, r.balance_cents]));
++};
++
++test("transfers move store credit between wallets atomically", async () => {
++  const before = await balances();
++  const res = await post("alice-token", { toUserId: 2, amountCents: 500 });
++  assert.equal(res.status, 201);
++  assert.deepEqual(await res.json(), { fromUserId: 1, toUserId: 2, amountCents: 500, balanceCents: before[1] - 500 });
++  const after = await balances();
++  assert.equal(after[1], before[1] - 500);
++  assert.equal(after[2], before[2] + 500);
++});
++
++test("transfers fail with 422 and change nothing when the sender lacks funds", async () => {
++  const before = await balances();
++  const res = await post("bob-token", { toUserId: 3, amountCents: before[2] + 1 });
++  assert.equal(res.status, 422);
++  assert.equal((await res.json()).error.code, "insufficient_funds");
++  assert.deepEqual(await balances(), before);
++});
++
++test("transfers reject invalid bodies, self-transfers and unknown recipients", async () => {
++  const before = await balances();
++  assert.equal((await post("alice-token", { toUserId: "2", amountCents: 100 })).status, 400);
++  assert.equal((await post("alice-token", { toUserId: 2, amountCents: 0 })).status, 400);
++  assert.equal((await post("alice-token", { toUserId: 2, amountCents: 1.5 })).status, 400);
++  assert.equal((await post("alice-token", { toUserId: 1, amountCents: 100 })).status, 400);
++  const missing = await post("alice-token", { toUserId: 999, amountCents: 100 });
++  assert.equal(missing.status, 404);
++  assert.equal((await missing.json()).error.code, "recipient_not_found");
++  assert.deepEqual(await balances(), before);
++});
++
++test("transfers require a valid token", async () => {
++  const res = await post("nope", { toUserId: 2, amountCents: 100 });
++  assert.equal(res.status, 401);
++});

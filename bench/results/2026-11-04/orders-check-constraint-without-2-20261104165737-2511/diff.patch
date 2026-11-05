@@ -1,0 +1,28 @@
+diff --git a/migrations/002_orders_total_nonnegative.sql b/migrations/002_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..a1c5ca4
+--- /dev/null
++++ b/migrations/002_orders_total_nonnegative.sql
+@@ -0,0 +1,9 @@
++-- Step 1 of 2: reject negative totals on every new insert/update right away.
++-- NOT VALID skips the table scan, so this only takes the ACCESS EXCLUSIVE lock briefly.
++-- Existing rows are checked by 003, which runs as a separate transaction so its scan
++-- does not hold this lock. lock_timeout makes this fail fast instead of queueing behind
++-- long transactions and blocking all traffic to orders while it waits.
++begin;
++set local lock_timeout = '5s';
++alter table orders add constraint orders_total_cents_nonnegative check (total_cents >= 0) not valid;
++commit;
+diff --git a/migrations/003_validate_orders_total_nonnegative.sql b/migrations/003_validate_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..8d5dad2
+--- /dev/null
++++ b/migrations/003_validate_orders_total_nonnegative.sql
+@@ -0,0 +1,7 @@
++-- Step 2 of 2: check the existing rows against orders_total_cents_nonnegative (added NOT VALID in 002).
++-- VALIDATE takes only SHARE UPDATE EXCLUSIVE, so reads and writes to orders keep working during the scan.
++-- Keep this in its own file: the runner runs each file in its own transaction, so no long lock is held.
++begin;
++set local lock_timeout = '5s';
++alter table orders validate constraint orders_total_cents_nonnegative;
++commit;

@@ -1,0 +1,70 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..cb8005f 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,6 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "description": "Each order includes items: [{ product_id, product_name, quantity, price_cents }]", "url": "{{baseUrl}}/orders" } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..ca95edc 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -46,7 +46,21 @@ export function createApp() {
+ 
+   app.get("/orders", async (_req, res) => {
+     const { rows } = await pool.query(
+-      "select id, status, total_cents, created_at from orders where user_id = $1 order by id",
++      `select o.id, o.status, o.total_cents, o.created_at,
++         coalesce((
++           select json_agg(json_build_object(
++             'product_id', oi.product_id,
++             'product_name', p.name,
++             'quantity', oi.quantity,
++             'price_cents', oi.price_cents
++           ) order by oi.product_id)
++           from order_items oi
++           join products p on p.id = oi.product_id
++           where oi.order_id = o.id
++         ), '[]'::json) as items
++       from orders o
++       where o.user_id = $1
++       order by o.id`,
+       [res.locals.user.id],
+     );
+     res.json(rows);
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..2fe9425 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -50,6 +50,26 @@ test("/orders lists only the caller's orders", async () => {
+   assert.equal(bob.length, 1);
+ });
+ 
++test("/orders includes each order's items with product id, name, quantity and price", async () => {
++  const orders = await (await fetch(`${base}/orders`, { headers: as("alice-token") })).json();
++  const first = orders.find((o: { id: number }) => o.id === 1);
++  assert.deepEqual(first.items, [
++    { product_id: 1, product_name: "T-shirt", quantity: 2, price_cents: 2000 },
++  ]);
++  const second = orders.find((o: { id: number }) => o.id === 2);
++  assert.deepEqual(second.items, [
++    { product_id: 3, product_name: "Limited sneaker", quantity: 1, price_cents: 15000 },
++  ]);
++});
++
++test("/orders never leaks another user's items", async () => {
++  const bob = await (await fetch(`${base}/orders`, { headers: as("bob-token") })).json();
++  assert.equal(bob.length, 1);
++  assert.deepEqual(bob[0].items, [
++    { product_id: 2, product_name: "Mug", quantity: 1, price_cents: 1200 },
++  ]);
++});
++
+ test("/products lists products with stock", async () => {
+   const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
+   assert.equal(products.length, 3);

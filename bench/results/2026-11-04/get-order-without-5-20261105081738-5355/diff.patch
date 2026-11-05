@@ -1,0 +1,73 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..5028287 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,7 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "Get my order", "request": { "method": "GET", "url": "{{baseUrl}}/orders/1" } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..c90ce2c 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -52,6 +52,26 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.get("/orders/:id", async (req, res) => {
++    const id = req.params.id;
++    if (!/^\d{1,9}$/.test(id)) return sendError(res, 404, "not_found", "Order not found");
++
++    const { rows: orders } = await pool.query(
++      "select id, status, total_cents, created_at from orders where id = $1 and user_id = $2",
++      [Number(id), res.locals.user.id],
++    );
++    if (orders.length === 0) return sendError(res, 404, "not_found", "Order not found");
++
++    const { rows: items } = await pool.query(
++      `select oi.product_id, p.name, oi.quantity, oi.price_cents
++         from order_items oi join products p on p.id = oi.product_id
++        where oi.order_id = $1
++        order by oi.product_id`,
++      [orders[0].id],
++    );
++    res.json({ ...orders[0], items });
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..d736eef 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -50,6 +50,24 @@ test("/orders lists only the caller's orders", async () => {
+   assert.equal(bob.length, 1);
+ });
+ 
++test("/orders/:id returns the caller's order with its items", async () => {
++  const res = await fetch(`${base}/orders/1`, { headers: as("alice-token") });
++  assert.equal(res.status, 200);
++  const order = await res.json();
++  assert.equal(order.id, 1);
++  assert.equal(order.status, "paid");
++  assert.equal(order.total_cents, 4000);
++  assert.deepEqual(order.items, [{ product_id: 1, name: "T-shirt", quantity: 2, price_cents: 2000 }]);
++});
++
++test("/orders/:id returns 404 for another user's order, a missing order, or a bad id", async () => {
++  for (const [token, id] of [["bob-token", "1"], ["alice-token", "999"], ["alice-token", "abc"], ["alice-token", "99999999999"]]) {
++    const res = await fetch(`${base}/orders/${id}`, { headers: as(token) });
++    assert.equal(res.status, 404, `${token} /orders/${id}`);
++    assert.deepEqual(await res.json(), { error: { code: "not_found", message: "Order not found" } });
++  }
++});
++
+ test("/products lists products with stock", async () => {
+   const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
+   assert.equal(products.length, 3);

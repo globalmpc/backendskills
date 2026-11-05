@@ -1,0 +1,79 @@
+✔ an admin adjusts a balance and it is recorded (43.39475ms)
+✔ other users can't adjust, and a balance can't go below 0 (6.082416ms)
+✖ convention: recorded adjustments can't be edited or deleted, even directly in the database (3.118375ms)
+✖ convention: the new endpoint is in the Postman collection (0.968ms)
+✖ convention: every migration has a down migration that exactly reverses it (0.7215ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 2
+ℹ fail 3
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 182.598917
+
+✖ failing tests:
+
+test at hidden-check/check.test.ts:1:1468
+✖ convention: recorded adjustments can't be edited or deleted, even directly in the database (3.118375ms)
+  AssertionError [ERR_ASSERTION]: Expected values to be strictly deep-equal:
+  + actual - expected
+  
+  + []
+  - [
+  -   {
+  -     admin_id: 3,
+  -     amount_cents: 300,
+  -     created_at: 2026-11-04T09:29:25.424Z,
+  -     id: 1,
+  -     reason: 'goodwill',
+  -     user_id: 2
+  -   }
+  - ]
+  
+      at TestContext.<anonymous> (/private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-9oNHFf/app/hidden-check/check.test.ts:32:10)
+      at process.processTicksAndRejections (node:internal/process/task_queues:104:5)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: true,
+    code: 'ERR_ASSERTION',
+    actual: [],
+    expected: [ { id: 1, user_id: 2, admin_id: 3, amount_cents: 300, reason: 'goodwill', created_at: 2026-11-04T09:29:25.424Z } ],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }
+
+test at hidden-check/check.test.ts:1:1925
+✖ convention: the new endpoint is in the Postman collection (0.968ms)
+  AssertionError [ERR_ASSERTION]: no POST /wallets/:userId/adjustments request
+      at TestContext.<anonymous> (/private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-9oNHFf/app/hidden-check/check.test.ts:36:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at hidden-check/check.test.ts:1:2115
+✖ convention: every migration has a down migration that exactly reverses it (0.7215ms)
+  AssertionError [ERR_ASSERTION]: migrations without migrations/down/<name>
+  + actual - expected
+  
+  + [
+  +   '002_wallet_adjustments.sql'
+  + ]
+  - []
+  
+      at TestContext.<anonymous> (/private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-9oNHFf/app/hidden-check/check.test.ts:41:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: [ '002_wallet_adjustments.sql' ],
+    expected: [],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }

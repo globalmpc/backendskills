@@ -1,0 +1,184 @@
+diff --git a/migrations/002_transfers.sql b/migrations/002_transfers.sql
+new file mode 100644
+index 0000000..2872639
+--- /dev/null
++++ b/migrations/002_transfers.sql
+@@ -0,0 +1,20 @@
++set lock_timeout = '5s';
++
++alter table wallets add constraint wallets_balance_nonneg check (balance_cents >= 0) not valid;
++
++-- Append-only ledger of store credit transfers.
++create table transfers (
++  id serial primary key,
++  from_user_id integer not null references users(id),
++  to_user_id integer not null references users(id),
++  amount_cents integer not null check (amount_cents > 0),
++  created_at timestamptz not null default now(),
++  check (from_user_id <> to_user_id)
++);
++
++create function transfers_append_only() returns trigger language plpgsql as $$
++begin
++  raise exception 'transfers is append-only';
++end $$;
++create trigger transfers_append_only before update or delete on transfers
++  for each row execute function transfers_append_only();
+diff --git a/migrations/003_validate_wallets_balance_nonneg.sql b/migrations/003_validate_wallets_balance_nonneg.sql
+new file mode 100644
+index 0000000..6e05a0c
+--- /dev/null
++++ b/migrations/003_validate_wallets_balance_nonneg.sql
+@@ -0,0 +1 @@
++alter table wallets validate constraint wallets_balance_nonneg;
+diff --git a/migrations/down/002_transfers.sql b/migrations/down/002_transfers.sql
+new file mode 100644
+index 0000000..5c95d65
+--- /dev/null
++++ b/migrations/down/002_transfers.sql
+@@ -0,0 +1,4 @@
++drop trigger transfers_append_only on transfers;
++drop function transfers_append_only();
++drop table transfers;
++alter table wallets drop constraint wallets_balance_nonneg;
+diff --git a/migrations/down/003_validate_wallets_balance_nonneg.sql b/migrations/down/003_validate_wallets_balance_nonneg.sql
+new file mode 100644
+index 0000000..adcbd4f
+--- /dev/null
++++ b/migrations/down/003_validate_wallets_balance_nonneg.sql
+@@ -0,0 +1,2 @@
++-- Validation has no direct reverse; down/002 drops the constraint itself.
++select 1;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..1d24682 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,15 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    {
++      "name": "Transfer store credit",
++      "request": {
++        "method": "POST",
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "body": { "mode": "raw", "raw": "{\n  \"toUserId\": 2,\n  \"amountCents\": 500\n}" },
++        "url": "{{baseUrl}}/transfers"
++      }
++    }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..67231a2 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -11,6 +11,8 @@ declare global {
+   }
+ }
+ 
++const MAX_INT = 2147483647; // wallets.balance_cents is a 32-bit integer
++
+ export function sendError(res: Response, status: number, code: string, message: string) {
+   res.status(status).json({ error: { code, message } });
+ }
+@@ -52,6 +54,52 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.post("/transfers", async (req, res) => {
++    const { toUserId, amountCents } = req.body ?? {};
++    if (!Number.isInteger(toUserId) || toUserId < 1 || toUserId > MAX_INT) {
++      return sendError(res, 400, "invalid_request", "toUserId must be a positive integer");
++    }
++    if (!Number.isInteger(amountCents) || amountCents < 1 || amountCents > MAX_INT) {
++      return sendError(res, 400, "invalid_request", "amountCents must be a positive integer");
++    }
++    const fromUserId: number = res.locals.user.id;
++    if (toUserId === fromUserId) {
++      return sendError(res, 400, "invalid_request", "Cannot transfer to yourself");
++    }
++
++    const client = await pool.connect();
++    try {
++      await client.query("begin");
++      // Lock both wallets, lowest user id first, so opposite transfers cannot deadlock.
++      const { rows: wallets } = await client.query(
++        "select user_id, balance_cents from wallets where user_id = any($1) order by user_id for update",
++        [[fromUserId, toUserId]],
++      );
++      const sender = wallets.find((w) => w.user_id === fromUserId);
++      if (!wallets.some((w) => w.user_id === toUserId)) {
++        await client.query("rollback");
++        return sendError(res, 404, "not_found", "Recipient not found");
++      }
++      if (!sender || sender.balance_cents < amountCents) {
++        await client.query("rollback");
++        return sendError(res, 409, "insufficient_funds", "Not enough store credit");
++      }
++      await client.query("update wallets set balance_cents = balance_cents - $2 where user_id = $1", [fromUserId, amountCents]);
++      await client.query("update wallets set balance_cents = balance_cents + $2 where user_id = $1", [toUserId, amountCents]);
++      const { rows: [transfer] } = await client.query(
++        "insert into transfers (from_user_id, to_user_id, amount_cents) values ($1, $2, $3) returning id, from_user_id, to_user_id, amount_cents, created_at",
++        [fromUserId, toUserId, amountCents],
++      );
++      await client.query("commit");
++      res.status(201).json(transfer);
++    } catch (err) {
++      await client.query("rollback").catch(() => {});
++      throw err;
++    } finally {
++      client.release();
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..0093422 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,41 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const post = (token: string, body: unknown) =>
++  fetch(`${base}/transfers`, { method: "POST", headers: { ...as(token), "content-type": "application/json" }, body: JSON.stringify(body) });
++const balance = async (id: number) => (await pool.query("select balance_cents from wallets where user_id = $1", [id])).rows[0].balance_cents;
++
++test("transfer moves credit and records it", async () => {
++  const a = await balance(1);
++  const b = await balance(2);
++  const res = await post("alice-token", { toUserId: 2, amountCents: 300 });
++  assert.equal(res.status, 201);
++  assert.equal(await balance(1), a - 300);
++  assert.equal(await balance(2), b + 300);
++});
++
++test("transfer rejects bad input with 400", async () => {
++  const bad = [{}, { toUserId: 2, amountCents: 0 }, { toUserId: 2, amountCents: -5 }, { toUserId: 2, amountCents: 1.5 },
++    { toUserId: "2", amountCents: 5 }, { toUserId: 1, amountCents: 5 }, { toUserId: 2, amountCents: 1e12 }];
++  for (const body of bad) {
++    const res = await post("alice-token", body);
++    assert.equal(res.status, 400, JSON.stringify(body));
++    assert.equal((await res.json()).error.code, "invalid_request");
++  }
++});
++
++test("transfer to unknown user is 404, overdraft is 409, no token is 401", async () => {
++  assert.equal((await post("alice-token", { toUserId: 999, amountCents: 1 })).status, 404);
++  assert.equal((await post("bob-token", { toUserId: 1, amountCents: 999999 })).status, 409);
++  assert.equal((await fetch(`${base}/transfers`, { method: "POST" })).status, 401);
++});
++
++test("concurrent opposite transfers: no deadlock, no overdraft, money conserved", async () => {
++  const total = (await balance(1)) + (await balance(2));
++  const results = await Promise.all(Array.from({ length: 20 }, (_, i) =>
++    i % 2 ? post("alice-token", { toUserId: 2, amountCents: 700 }) : post("bob-token", { toUserId: 1, amountCents: 600 })));
++  for (const r of results) assert.ok([201, 409].includes(r.status), `status ${r.status}`);
++  assert.equal((await balance(1)) + (await balance(2)), total);
++  assert.ok((await balance(1)) >= 0 && (await balance(2)) >= 0);
++});

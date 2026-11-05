@@ -1,0 +1,163 @@
+diff --git a/migrations/002_product_discount.sql b/migrations/002_product_discount.sql
+new file mode 100644
+index 0000000..e6f6420
+--- /dev/null
++++ b/migrations/002_product_discount.sql
+@@ -0,0 +1,6 @@
++-- Adding a column with a constant default is metadata-only on Postgres 11+; the lock timeout
++-- makes the deploy fail fast instead of queueing behind a long query.
++set local lock_timeout = '5s';
++
++alter table products
++  add column discount_percent integer not null default 0 check (discount_percent between 0 and 100);
+diff --git a/migrations/down/002_product_discount.sql b/migrations/down/002_product_discount.sql
+new file mode 100644
+index 0000000..39a2dc6
+--- /dev/null
++++ b/migrations/down/002_product_discount.sql
+@@ -0,0 +1,3 @@
++set local lock_timeout = '5s';
++
++alter table products drop column discount_percent;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..9cb4ecc 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,16 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    {
++      "name": "Set product discount (admin)",
++      "request": {
++        "method": "PATCH",
++        "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "admin-token", "type": "string" }] },
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "url": "{{baseUrl}}/products/1",
++        "body": { "mode": "raw", "raw": "{\"discountPercent\": 25}", "options": { "raw": { "language": "json" } } }
++      }
++    }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..a1d8884 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -52,7 +52,29 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
+-  app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
++  app.patch("/products/:id", async (req, res) => {
++    if (res.locals.user.role !== "admin") return sendError(res, 403, "forbidden", "Admins only");
++
++    const rawId = req.params.id;
++    if (!/^[1-9]\d*$/.test(rawId)) return sendError(res, 400, "invalid_id", "Product id must be a positive integer");
++    const id = Number(rawId);
++    if (id > 2147483647) return sendError(res, 404, "not_found", "Product not found");
++
++    const discountPercent = (req.body ?? {}).discountPercent;
++    if (!Number.isInteger(discountPercent) || discountPercent < 0 || discountPercent > 100) {
++      return sendError(res, 400, "invalid_discount_percent", "discountPercent must be a whole number from 0 to 100");
++    }
++
++    const { rows } = await pool.query(
++      "update products set discount_percent = $1 where id = $2 returning id, name, price_cents, stock, discount_percent",
++      [discountPercent, id],
++    );
++    if (rows.length === 0) return sendError(res, 404, "not_found", "Product not found");
++    res.json(rows[0]);
++  });
++
++  app.use((err: Error & { type?: string }, _req: Request, res: Response, _next: NextFunction) => {
++    if (err.type === "entity.parse.failed") return sendError(res, 400, "invalid_json", "Request body is not valid JSON");
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+   });
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..31f6480 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,80 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const patchProduct = (token: string | null, id: string, body: string) =>
++  fetch(`${base}/products/${id}`, {
++    method: "PATCH",
++    headers: { ...(token ? as(token) : {}), "content-type": "application/json" },
++    body,
++  });
++
++const discountOf = async (id: number) =>
++  (await pool.query("select discount_percent from products where id = $1", [id])).rows[0].discount_percent;
++
++test("products default to a 0 discount", async () => {
++  assert.equal(await discountOf(1), 0);
++});
++
++test("an admin can set a product's discount", async () => {
++  const res = await patchProduct("admin-token", "1", JSON.stringify({ discountPercent: 25 }));
++  assert.equal(res.status, 200);
++  const product = await res.json();
++  assert.equal(product.id, 1);
++  assert.equal(product.discount_percent, 25);
++  assert.equal(await discountOf(1), 25);
++});
++
++test("the discount can be set to the bounds 0 and 100", async () => {
++  assert.equal((await patchProduct("admin-token", "1", JSON.stringify({ discountPercent: 100 }))).status, 200);
++  assert.equal(await discountOf(1), 100);
++  assert.equal((await patchProduct("admin-token", "1", JSON.stringify({ discountPercent: 0 }))).status, 200);
++  assert.equal(await discountOf(1), 0);
++});
++
++test("a non-admin cannot change a discount", async () => {
++  const res = await patchProduct("alice-token", "2", JSON.stringify({ discountPercent: 10 }));
++  assert.equal(res.status, 403);
++  assert.deepEqual(await res.json(), { error: { code: "forbidden", message: "Admins only" } });
++  assert.equal(await discountOf(2), 0);
++});
++
++test("invalid discounts are rejected with 400 and change nothing", async () => {
++  const bad = [
++    { discountPercent: 101 },
++    { discountPercent: -1 },
++    { discountPercent: 12.5 },
++    { discountPercent: "10" },
++    { discountPercent: null },
++    { percent: 10 },
++    [],
++  ];
++  for (const body of bad) {
++    const res = await patchProduct("admin-token", "3", JSON.stringify(body));
++    assert.equal(res.status, 400, JSON.stringify(body));
++    assert.equal((await res.json()).error.code, "invalid_discount_percent");
++  }
++  const noBody = await fetch(`${base}/products/3`, { method: "PATCH", headers: { ...as("admin-token") } });
++  assert.equal(noBody.status, 400);
++  assert.equal(await discountOf(3), 0);
++});
++
++test("a malformed JSON body is a 400, not a 500", async () => {
++  const res = await patchProduct("admin-token", "3", "{not json");
++  assert.equal(res.status, 400);
++  assert.equal((await res.json()).error.code, "invalid_json");
++});
++
++test("a bad product id is a 400; an unknown product is a 404", async () => {
++  const badId = await patchProduct("admin-token", "abc", JSON.stringify({ discountPercent: 5 }));
++  assert.equal(badId.status, 400);
++  const missing = await patchProduct("admin-token", "999999", JSON.stringify({ discountPercent: 5 }));
++  assert.equal(missing.status, 404);
++  const overflow = await patchProduct("admin-token", "99999999999", JSON.stringify({ discountPercent: 5 }));
++  assert.equal(overflow.status, 404);
++});
++
++test("the discount endpoint requires a token", async () => {
++  const res = await patchProduct(null, "1", JSON.stringify({ discountPercent: 5 }));
++  assert.equal(res.status, 401);
++});

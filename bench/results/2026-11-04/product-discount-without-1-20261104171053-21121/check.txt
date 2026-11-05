@@ -1,0 +1,50 @@
+✔ an admin sets a discount (38.557333ms)
+✔ other users can't, and a discount over 100 is rejected (7.594875ms)
+✔ convention: the database itself refuses a discount over 100 (8.152458ms)
+✖ convention: the new endpoint is in the Postman collection (1.442708ms)
+✖ convention: every migration has a down migration that exactly reverses it (1.652167ms)
+ℹ tests 5
+ℹ suites 0
+ℹ pass 3
+ℹ fail 2
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 186.312292
+
+✖ failing tests:
+
+test at hidden-check/check.test.ts:1:1367
+✖ convention: the new endpoint is in the Postman collection (1.442708ms)
+  AssertionError [ERR_ASSERTION]: no PATCH /products/:id request
+      at TestContext.<anonymous> (/private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-KpFb8e/app/hidden-check/check.test.ts:31:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: false,
+    expected: true,
+    operator: '==',
+    diff: 'simple'
+  }
+
+test at hidden-check/check.test.ts:1:1532
+✖ convention: every migration has a down migration that exactly reverses it (1.652167ms)
+  AssertionError [ERR_ASSERTION]: migrations without migrations/down/<name>
+  + actual - expected
+  
+  + [
+  +   '002_product_discount.sql'
+  + ]
+  - []
+  
+      at TestContext.<anonymous> (/private/var/folders/6t/m7p4z0gs39v34b8mcsy0jzn80000gn/T/bench-KpFb8e/app/hidden-check/check.test.ts:36:10)
+      at async Test.run (node:internal/test_runner/test:1409:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:974:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: [ '002_product_discount.sql' ],
+    expected: [],
+    operator: 'deepStrictEqual',
+    diff: 'simple'
+  }

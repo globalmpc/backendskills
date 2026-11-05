@@ -1,0 +1,1 @@
+Users can review products they've bought: `POST /products/:id/reviews` with `{ "rating": 1-5, "body": string }`, one review per user per product, and `GET /products/:id/reviews` to list them. Store them in a new `reviews` table (`product_id`, `user_id`, `rating`, `body`, `created_at`).

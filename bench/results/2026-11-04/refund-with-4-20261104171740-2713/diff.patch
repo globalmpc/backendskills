@@ -1,0 +1,178 @@
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..25f3cb6 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -12,6 +12,7 @@
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    { "name": "Refund order", "request": { "method": "POST", "url": "{{baseUrl}}/orders/1/refund" } }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..9d02d01 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { payments } from "./payments.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -52,6 +53,43 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  // Full refund of a paid order. Only the order's owner may refund it (others get 404).
++  app.post("/orders/:id/refund", async (req, res) => {
++    const idParam = req.params.id;
++    const id = Number(idParam);
++    if (!/^\d+$/.test(idParam) || !Number.isSafeInteger(id) || id < 1 || id > 2147483647) {
++      return sendError(res, 400, "invalid_id", "Order id must be a positive integer");
++    }
++
++    const { rows: [order] } = await pool.query(
++      "select id, status, total_cents, payment_id from orders where id = $1 and user_id = $2",
++      [id, res.locals.user.id],
++    );
++    if (!order) return sendError(res, 404, "not_found", "Order not found");
++    if (order.status !== "paid") return sendError(res, 409, "not_paid", "Only paid orders can be refunded");
++
++    // No transaction is open here, so no row locks are held during the provider call. The key is derived
++    // from the order, so a retry or a concurrent request refunds the payment at most once.
++    try {
++      await payments.refund({
++        paymentId: order.payment_id,
++        amountCents: order.total_cents,
++        idempotencyKey: `refund-order-${order.id}`,
++      });
++    } catch (err) {
++      console.error(err);
++      return sendError(res, 502, "refund_failed", "Refund failed");
++    }
++
++    // Change state only from the state we expect. If another request already marked it, nothing changes.
++    const { rows: [updated] } = await pool.query(
++      "update orders set status = 'refunded' where id = $1 and status = 'paid' returning id, status, total_cents, created_at",
++      [id],
++    );
++    if (!updated) return sendError(res, 409, "not_paid", "Only paid orders can be refunded");
++    res.json(updated);
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/refunds.test.ts b/test/refunds.test.ts
+new file mode 100644
+index 0000000..ff8cf21
+--- /dev/null
++++ b/test/refunds.test.ts
+@@ -0,0 +1,104 @@
++import { test, before, after } from "node:test";
++import assert from "node:assert/strict";
++import type { Server } from "node:http";
++import { resetDatabase } from "../src/migrate.ts";
++import { createApp } from "../src/app.ts";
++import { pool } from "../src/db.ts";
++
++let server: Server;
++let base: string;
++
++before(async () => {
++  await resetDatabase();
++  server = createApp().listen(0);
++  const address = server.address();
++  if (address === null || typeof address === "string") throw new Error("no port");
++  base = `http://localhost:${address.port}`;
++});
++
++after(async () => {
++  server.close();
++  await pool.end();
++});
++
++const as = (token: string) => ({ authorization: `Bearer ${token}` });
++const refund = (id: string | number, token: string) =>
++  fetch(`${base}/orders/${id}/refund`, { method: "POST", headers: as(token) });
++const refundCalls = async (paymentId: string) =>
++  (await pool.query("select count(*)::int as n from payment_calls where kind = 'refund' and payment_id = $1", [paymentId])).rows[0].n;
++const statusOf = async (id: number) => (await pool.query("select status from orders where id = $1", [id])).rows[0].status;
++
++test("refunding a paid order refunds it in full and marks it refunded", async () => {
++  const res = await refund(1, "alice-token");
++  assert.equal(res.status, 200);
++  const body = await res.json();
++  assert.equal(body.id, 1);
++  assert.equal(body.status, "refunded");
++  assert.equal(body.total_cents, 4000);
++  assert.equal(await statusOf(1), "refunded");
++  assert.equal(await refundCalls("pay_seed_1"), 1);
++  const { rows } = await pool.query("select amount_cents from payment_calls where kind = 'refund' and payment_id = 'pay_seed_1'");
++  assert.deepEqual(rows, [{ amount_cents: 4000 }]);
++});
++
++test("refunding an already refunded order is rejected and does not call the provider again", async () => {
++  const res = await refund(1, "alice-token");
++  assert.equal(res.status, 409);
++  assert.deepEqual(await res.json(), { error: { code: "not_paid", message: "Only paid orders can be refunded" } });
++  assert.equal(await refundCalls("pay_seed_1"), 1);
++});
++
++test("someone else's order looks like a missing one", async () => {
++  const res = await refund(2, "bob-token");
++  assert.equal(res.status, 404);
++  assert.equal(await statusOf(2), "paid");
++  assert.equal(await refundCalls("pay_seed_2"), 0);
++});
++
++test("an unknown order is 404", async () => {
++  const res = await refund(999999, "alice-token");
++  assert.equal(res.status, 404);
++});
++
++test("only paid orders can be refunded: a pending order is rejected", async () => {
++  const { rows: [pending] } = await pool.query(
++    "insert into orders (user_id, status, total_cents) values (1, 'pending', 700) returning id",
++  );
++  const res = await refund(pending.id, "alice-token");
++  assert.equal(res.status, 409);
++  assert.equal(await statusOf(pending.id), "pending");
++});
++
++test("a non-numeric or out-of-range id is a 400", async () => {
++  assert.equal((await refund("abc", "alice-token")).status, 400);
++  assert.equal((await refund("1.5", "alice-token")).status, 400);
++  assert.equal((await refund("99999999999999", "alice-token")).status, 400);
++});
++
++test("refund requires a valid token", async () => {
++  const res = await fetch(`${base}/orders/2/refund`, { method: "POST", headers: as("nope") });
++  assert.equal(res.status, 401);
++});
++
++test("when the provider fails, the order stays paid and the error is in the standard format", async () => {
++  // A paid order without a payment id: the provider client cannot refund it, so the call fails.
++  const { rows: [broken] } = await pool.query(
++    "insert into orders (user_id, status, total_cents) values (1, 'paid', 900) returning id",
++  );
++  const res = await refund(broken.id, "alice-token");
++  assert.equal(res.status, 502);
++  assert.deepEqual(await res.json(), { error: { code: "refund_failed", message: "Refund failed" } });
++  assert.equal(await statusOf(broken.id), "paid");
++});
++
++test("parallel refund requests for one order refund the payment once", async () => {
++  const { rows: [order] } = await pool.query(
++    "insert into orders (user_id, status, total_cents, payment_id) values (1, 'paid', 2500, 'pay_concurrent') returning id",
++  );
++  const responses = await Promise.all(Array.from({ length: 10 }, () => refund(order.id, "alice-token")));
++  const statuses = responses.map((r) => r.status).sort();
++  assert.equal(statuses.filter((s) => s === 200).length, 1, `statuses: ${statuses}`);
++  assert.ok(statuses.every((s) => s === 200 || s === 409), `statuses: ${statuses}`);
++  assert.equal(await statusOf(order.id), "refunded");
++  assert.equal(await refundCalls("pay_concurrent"), 1);
++});

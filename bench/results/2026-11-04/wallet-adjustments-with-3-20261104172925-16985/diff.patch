@@ -1,0 +1,267 @@
+diff --git a/migrations/002_wallet_adjustments.sql b/migrations/002_wallet_adjustments.sql
+new file mode 100644
+index 0000000..6b71afb
+--- /dev/null
++++ b/migrations/002_wallet_adjustments.sql
+@@ -0,0 +1,22 @@
++-- Store credit can never go negative. Added as NOT VALID so the table isn't scanned under the lock;
++-- VALIDATE then checks existing rows without blocking writes.
++alter table wallets add constraint wallets_balance_nonnegative check (balance_cents >= 0) not valid;
++alter table wallets validate constraint wallets_balance_nonnegative;
++
++-- Every admin correction to a wallet. Append-only: rows are the audit trail.
++create table wallet_adjustments (
++  id serial primary key,
++  user_id integer not null references users(id),
++  admin_id integer not null references users(id),
++  amount_cents integer not null check (amount_cents <> 0), -- positive credits, negative debits
++  reason text not null check (length(trim(reason)) > 0),
++  created_at timestamptz not null default now()
++);
++
++create function wallet_adjustments_append_only() returns trigger language plpgsql as $$
++begin
++  raise exception 'wallet_adjustments is append-only';
++end $$;
++
++create trigger wallet_adjustments_append_only before update or delete on wallet_adjustments
++  for each row execute function wallet_adjustments_append_only();
+diff --git a/migrations/down/002_wallet_adjustments.sql b/migrations/down/002_wallet_adjustments.sql
+new file mode 100644
+index 0000000..0713108
+--- /dev/null
++++ b/migrations/down/002_wallet_adjustments.sql
+@@ -0,0 +1,4 @@
++drop trigger if exists wallet_adjustments_append_only on wallet_adjustments;
++drop function if exists wallet_adjustments_append_only();
++drop table if exists wallet_adjustments;
++alter table wallets drop constraint if exists wallets_balance_nonnegative;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..0807609 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -6,12 +6,23 @@
+   "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "{{token}}", "type": "string" }] },
+   "variable": [
+     { "key": "baseUrl", "value": "http://localhost:3000" },
+-    { "key": "token", "value": "alice-token" }
++    { "key": "token", "value": "alice-token" },
++    { "key": "userId", "value": "2" }
+   ],
+   "item": [
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+-    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
++    { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } },
++    {
++      "name": "Adjust a user's wallet (admin)",
++      "request": {
++        "method": "POST",
++        "auth": { "type": "bearer", "bearer": [{ "key": "token", "value": "admin-token", "type": "string" }] },
++        "header": [{ "key": "content-type", "value": "application/json" }],
++        "url": "{{baseUrl}}/wallets/{{userId}}/adjustments",
++        "body": { "mode": "raw", "raw": "{\n  \"amountCents\": -300,\n  \"reason\": \"Correction for a duplicate credit\"\n}" }
++      }
++    }
+   ]
+ }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..cf4b74e 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,8 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { adjustWallet, WalletError } from "./wallets.ts";
++
++const INT4_MAX = 2147483647;
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -52,6 +55,33 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  // Admin correction of a user's store credit: positive amounts credit, negative amounts debit.
++  app.post("/wallets/:userId/adjustments", async (req, res) => {
++    const caller = res.locals.user;
++    if (caller.role !== "admin") return sendError(res, 403, "forbidden", "Admins only");
++
++    const userId = Number(req.params.userId);
++    if (!/^[1-9]\d*$/.test(req.params.userId) || userId > INT4_MAX) {
++      return sendError(res, 400, "invalid_user_id", "userId must be a positive integer");
++    }
++
++    const { amountCents, reason } = req.body ?? {};
++    if (!Number.isSafeInteger(amountCents) || amountCents === 0 || Math.abs(amountCents) > INT4_MAX) {
++      return sendError(res, 400, "invalid_amount", "amountCents must be a non-zero integer");
++    }
++    if (typeof reason !== "string" || reason.trim() === "" || reason.length > 500) {
++      return sendError(res, 400, "invalid_reason", "reason must be 1-500 characters");
++    }
++
++    try {
++      const { adjustment, balance_cents } = await adjustWallet(userId, caller.id, amountCents, reason.trim());
++      res.status(201).json({ ...adjustment, balance_cents });
++    } catch (err) {
++      if (err instanceof WalletError) return sendError(res, err.status, err.code, err.message);
++      throw err;
++    }
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/src/wallets.ts b/src/wallets.ts
+new file mode 100644
+index 0000000..56d29c7
+--- /dev/null
++++ b/src/wallets.ts
+@@ -0,0 +1,52 @@
++import { pool } from "./db.ts";
++
++export class WalletError extends Error {
++  constructor(
++    readonly status: number,
++    readonly code: string,
++    message: string,
++  ) {
++    super(message);
++  }
++}
++
++export type AdjustmentResult = {
++  adjustment: { id: number; user_id: number; admin_id: number; amount_cents: number; reason: string; created_at: Date };
++  balance_cents: number;
++};
++
++// Applies an admin correction to a user's store credit and records it, in one transaction.
++// The balance check is part of the UPDATE, so two concurrent debits can't both pass it.
++export async function adjustWallet(userId: number, adminId: number, amountCents: number, reason: string): Promise<AdjustmentResult> {
++  const client = await pool.connect();
++  try {
++    await client.query("begin");
++
++    const { rows: users } = await client.query("select id from users where id = $1", [userId]);
++    if (users.length === 0) throw new WalletError(404, "not_found", "User not found");
++
++    // Users always have a wallet row in practice, but don't assume it: create it at zero if missing.
++    await client.query("insert into wallets (user_id, balance_cents) values ($1, 0) on conflict (user_id) do nothing", [userId]);
++
++    const { rows: [wallet] } = await client.query(
++      "update wallets set balance_cents = balance_cents + $2 where user_id = $1 and balance_cents + $2 >= 0 returning balance_cents",
++      [userId, amountCents],
++    );
++    if (!wallet) throw new WalletError(409, "insufficient_balance", "Adjustment would make the balance negative");
++
++    const { rows: [adjustment] } = await client.query(
++      "insert into wallet_adjustments (user_id, admin_id, amount_cents, reason) values ($1, $2, $3, $4) returning id, user_id, admin_id, amount_cents, reason, created_at",
++      [userId, adminId, amountCents, reason],
++    );
++
++    await client.query("commit");
++    return { adjustment, balance_cents: wallet.balance_cents };
++  } catch (err) {
++    await client.query("rollback");
++    // integer overflow of the balance (SQLSTATE 22003)
++    if ((err as { code?: string }).code === "22003") throw new WalletError(400, "amount_out_of_range", "Adjustment is out of range");
++    throw err;
++  } finally {
++    client.release();
++  }
++}
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..c1c6133 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,89 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const adjust = (token: string, userId: string | number, body: unknown) =>
++  fetch(`${base}/wallets/${userId}/adjustments`, {
++    method: "POST",
++    headers: { ...as(token), "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++const balance = async (userId: number) =>
++  (await pool.query("select balance_cents from wallets where user_id = $1", [userId])).rows[0].balance_cents;
++
++test("only admins can adjust a wallet", async () => {
++  const res = await adjust("alice-token", 2, { amountCents: 100, reason: "nope" });
++  assert.equal(res.status, 403);
++  assert.equal(await balance(2), 500);
++});
++
++test("admin credit and debit are applied and recorded with the admin as author", async () => {
++  const credit = await adjust("admin-token", 2, { amountCents: 1000, reason: "Goodwill credit" });
++  assert.equal(credit.status, 201);
++  const body = await credit.json();
++  assert.equal(body.balance_cents, 1500);
++  assert.equal(body.admin_id, 3);
++
++  const debit = await adjust("admin-token", 2, { amountCents: -300, reason: "Correction" });
++  assert.equal(debit.status, 201);
++  assert.equal((await debit.json()).balance_cents, 1200);
++  assert.equal(await balance(2), 1200);
++
++  const { rows } = await pool.query("select amount_cents, reason, admin_id from wallet_adjustments where user_id = 2 order by id");
++  assert.deepEqual(rows, [
++    { amount_cents: 1000, reason: "Goodwill credit", admin_id: 3 },
++    { amount_cents: -300, reason: "Correction", admin_id: 3 },
++  ]);
++});
++
++test("a debit that would make the balance negative is rejected and changes nothing", async () => {
++  const res = await adjust("admin-token", 2, { amountCents: -5000, reason: "Too much" });
++  assert.equal(res.status, 409);
++  assert.equal((await res.json()).error.code, "insufficient_balance");
++  assert.equal(await balance(2), 1200);
++  const { rows } = await pool.query("select count(*)::int as n from wallet_adjustments where user_id = 2 and reason = 'Too much'");
++  assert.equal(rows[0].n, 0);
++});
++
++test("bad input is a 400 and an unknown user is a 404", async () => {
++  const cases: [string | number, unknown][] = [
++    [2, { amountCents: 0, reason: "zero" }],
++    [2, { amountCents: 1.5, reason: "fraction" }],
++    [2, { amountCents: "100", reason: "string" }],
++    [2, { amountCents: 100, reason: "   " }],
++    [2, { amountCents: 100 }],
++    [2, { amountCents: 100, reason: "x".repeat(501) }],
++    ["abc", { amountCents: 100, reason: "bad id" }],
++    ["0", { amountCents: 100, reason: "bad id" }],
++  ];
++  for (const [userId, body] of cases) {
++    const res = await adjust("admin-token", userId, body);
++    assert.equal(res.status, 400, JSON.stringify({ userId, body }));
++  }
++  const missing = await adjust("admin-token", 999, { amountCents: 100, reason: "no such user" });
++  assert.equal(missing.status, 404);
++});
++
++test("a wallet row that doesn't exist yet is created at zero", async () => {
++  await pool.query("insert into users (email, name, api_token, password_hash) values ('carol@example.com', 'Carol', 'carol-token', 'x')");
++  const { rows: [carol] } = await pool.query("select id from users where email = 'carol@example.com'");
++  const res = await adjust("admin-token", carol.id, { amountCents: 250, reason: "First credit" });
++  assert.equal(res.status, 201);
++  assert.equal(await balance(carol.id), 250);
++});
++
++test("the audit table rejects updates and deletes", async () => {
++  await assert.rejects(pool.query("update wallet_adjustments set reason = 'changed'"), /append-only/);
++  await assert.rejects(pool.query("delete from wallet_adjustments"), /append-only/);
++});
++
++test("concurrent debits can't overdraw: exactly what the balance covers goes through", async () => {
++  // Alice has 10000. Ten parallel debits of 2000 must leave exactly 5 succeeding and a balance of 0.
++  const results = await Promise.all(
++    Array.from({ length: 10 }, () => adjust("admin-token", 1, { amountCents: -2000, reason: "parallel" })),
++  );
++  const statuses = results.map((r) => r.status).sort();
++  assert.deepEqual(statuses, [201, 201, 201, 201, 201, 409, 409, 409, 409, 409]);
++  assert.equal(await balance(1), 0);
++});

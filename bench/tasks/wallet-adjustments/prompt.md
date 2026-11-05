@@ -1,0 +1,1 @@
+Admins need to correct users' store credit. Add `POST /wallets/:userId/adjustments` (admins only) with `{ "amountCents": number, "reason": string }`. The amount can be negative, but the balance can't go below 0. Record every adjustment in a new `wallet_adjustments` table (`user_id`, `admin_id`, `amount_cents`, `reason`, `created_at`).

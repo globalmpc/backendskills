@@ -1,0 +1,58 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..1b2c284 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -52,6 +52,24 @@ export function createApp() {
+     res.json(rows);
+   });
+ 
++  app.get("/orders/:id", async (req, res) => {
++    // Only the caller's own orders are visible; anything else (including another user's order) is a 404.
++    const id = Number(req.params.id);
++    if (!/^\d+$/.test(req.params.id) || id < 1 || id > 2147483647) {
++      return sendError(res, 404, "not_found", "Order not found");
++    }
++    const { rows: orders } = await pool.query(
++      "select id, status, total_cents, created_at from orders where id = $1 and user_id = $2",
++      [id, res.locals.user.id],
++    );
++    if (orders.length === 0) return sendError(res, 404, "not_found", "Order not found");
++    const { rows: items } = await pool.query(
++      "select product_id, quantity, price_cents from order_items where order_id = $1 order by product_id",
++      [id],
++    );
++    res.json({ ...orders[0], items });
++  });
++
+   app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
+     console.error(err);
+     sendError(res, 500, "internal", "Something went wrong");
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..9501f6b 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -50,6 +50,24 @@ test("/orders lists only the caller's orders", async () => {
+   assert.equal(bob.length, 1);
+ });
+ 
++test("/orders/:id returns the caller's order with its items", async () => {
++  const res = await fetch(`${base}/orders/1`, { headers: as("alice-token") });
++  assert.equal(res.status, 200);
++  const order = await res.json();
++  assert.equal(order.id, 1);
++  assert.equal(order.status, "paid");
++  assert.equal(order.total_cents, 4000);
++  assert.deepEqual(order.items, [{ product_id: 1, quantity: 2, price_cents: 2000 }]);
++});
++
++test("/orders/:id returns 404 for another user's order, a missing order, or a malformed id", async () => {
++  for (const path of ["/orders/3", "/orders/9999", "/orders/abc", "/orders/99999999999"]) {
++    const res = await fetch(`${base}${path}`, { headers: as("alice-token") });
++    assert.equal(res.status, 404, path);
++    assert.deepEqual(await res.json(), { error: { code: "not_found", message: "Order not found" } });
++  }
++});
++
+ test("/products lists products with stock", async () => {
+   const products = await (await fetch(`${base}/products`, { headers: as("alice-token") })).json();
+   assert.equal(products.length, 3);

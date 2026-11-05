@@ -1,0 +1,73 @@
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..3f9707c 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { verifyPassword } from "./passwords.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -33,6 +34,20 @@ export function createApp() {
+     res.json({ ok: true });
+   });
+ 
++  // Unauthenticated: this is how a client obtains a token, so it must sit above `auth`.
++  app.post("/login", async (req, res) => {
++    const { email, password } = req.body ?? {};
++    if (typeof email !== "string" || typeof password !== "string") {
++      return sendError(res, 400, "invalid_body", "email and password must be strings");
++    }
++    const { rows } = await pool.query("select api_token, password_hash from users where email = $1", [email]);
++    const user = rows[0];
++    if (!user || !(await verifyPassword(password, user.password_hash))) {
++      return sendError(res, 401, "invalid_credentials", "Invalid email or password");
++    }
++    res.json({ token: user.api_token });
++  });
++
+   app.use(auth);
+ 
+   app.get("/me", (_req, res) => {
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..bf33549 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -35,6 +35,36 @@ test("requests without a valid token get 401 in the standard error format", asyn
+   assert.deepEqual(await res.json(), { error: { code: "unauthorized", message: "Missing or invalid token" } });
+ });
+ 
++const login = (body: unknown) =>
++  fetch(`${base}/login`, {
++    method: "POST",
++    headers: { "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("login with correct email and password returns the api_token, without a Bearer token", async () => {
++  const res = await login({ email: "alice@example.com", password: "alice-password" });
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { token: "alice-token" });
++});
++
++test("login with the wrong password or unknown email gets the same 401", async () => {
++  const wrong = await login({ email: "alice@example.com", password: "nope" });
++  const unknown = await login({ email: "nobody@example.com", password: "alice-password" });
++  assert.equal(wrong.status, 401);
++  assert.equal(unknown.status, 401);
++  assert.deepEqual(await wrong.json(), { error: { code: "invalid_credentials", message: "Invalid email or password" } });
++  assert.deepEqual(await unknown.json(), { error: { code: "invalid_credentials", message: "Invalid email or password" } });
++});
++
++test("login rejects a body without string email and password", async () => {
++  const res = await login({ email: "alice@example.com" });
++  assert.equal(res.status, 400);
++  assert.equal((await res.json()).error.code, "invalid_body");
++  const noBody = await fetch(`${base}/login`, { method: "POST" });
++  assert.equal(noBody.status, 400);
++});
++
+ test("/me returns the caller", async () => {
+   const res = await fetch(`${base}/me`, { headers: as("alice-token") });
+   assert.equal(res.status, 200);

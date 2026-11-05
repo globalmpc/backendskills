@@ -1,0 +1,36 @@
+diff --git a/migrations/002_orders_total_nonnegative.sql b/migrations/002_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..5e08cfa
+--- /dev/null
++++ b/migrations/002_orders_total_nonnegative.sql
+@@ -0,0 +1,5 @@
++-- Enforce non-negative totals for all new writes. NOT VALID skips the scan of existing rows,
++-- so this only takes the ACCESS EXCLUSIVE lock for an instant. Fail fast rather than queue
++-- behind long-running transactions. 003 validates the existing rows.
++set local lock_timeout = '5s';
++alter table orders add constraint orders_total_cents_nonnegative check (total_cents >= 0) not valid;
+diff --git a/migrations/003_validate_orders_total_nonnegative.sql b/migrations/003_validate_orders_total_nonnegative.sql
+new file mode 100644
+index 0000000..d6aa5ec
+--- /dev/null
++++ b/migrations/003_validate_orders_total_nonnegative.sql
+@@ -0,0 +1,4 @@
++-- Check every existing row against the constraint added in 002. VALIDATE CONSTRAINT takes only
++-- SHARE UPDATE EXCLUSIVE, so reads and writes to orders continue while it scans. Kept in its own
++-- file so the 002 lock is released before this scan starts.
++alter table orders validate constraint orders_total_cents_nonnegative;
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..b859eb0 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,10 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++test("the database rejects an order with a negative total", async () => {
++  await assert.rejects(
++    pool.query("insert into orders (user_id, total_cents) values (1, -1)"),
++    (err: { code?: string }) => err.code === "23514", // check_violation
++  );
++});

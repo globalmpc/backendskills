@@ -1,0 +1,166 @@
+diff --git a/README.md b/README.md
+index 8cbb875..368a4ab 100644
+--- a/README.md
++++ b/README.md
+@@ -4,6 +4,7 @@ Small shop backend: users, products, orders, payments.
+ 
+ - TypeScript on Node 24, Express 5, Postgres (`pg`). Run TypeScript directly with `tsx`.
+ - Auth: `Authorization: Bearer <api_token>`; the current user is `res.locals.user`.
++- Login: `POST /login` with `{ "email", "password" }` (no token needed) returns `{ "token": <api_token> }`. Attempts are rate limited in `login_attempts` (migration `002`).
+ - Errors: `{ "error": { "code", "message" } }` via `sendError` in `src/app.ts`.
+ - Passwords are stored as scrypt hashes in `users.password_hash`; check one with `verifyPassword` from `src/passwords.ts`.
+ - Payments go through `src/payments.ts` (the provider client). Never call the provider any other way.
+diff --git a/migrations/002_login_attempts.sql b/migrations/002_login_attempts.sql
+new file mode 100644
+index 0000000..aa78d09
+--- /dev/null
++++ b/migrations/002_login_attempts.sql
+@@ -0,0 +1,6 @@
++-- Counts login tries per account and per IP so passwords can't be guessed endlessly. Shared by every server.
++create table login_attempts (
++  key text primary key,
++  n integer not null,
++  window_start timestamptz not null default now()
++);
+diff --git a/migrations/down/002_login_attempts.sql b/migrations/down/002_login_attempts.sql
+new file mode 100644
+index 0000000..44e5305
+--- /dev/null
++++ b/migrations/down/002_login_attempts.sql
+@@ -0,0 +1 @@
++drop table login_attempts;
+diff --git a/postman/shop-api.postman_collection.json b/postman/shop-api.postman_collection.json
+index 594a479..0849feb 100644
+--- a/postman/shop-api.postman_collection.json
++++ b/postman/shop-api.postman_collection.json
+@@ -10,6 +10,16 @@
+   ],
+   "item": [
+     { "name": "Health", "request": { "method": "GET", "auth": { "type": "noauth" }, "url": "{{baseUrl}}/health" } },
++    {
++      "name": "Login",
++      "request": {
++        "method": "POST",
++        "auth": { "type": "noauth" },
++        "header": [{ "key": "Content-Type", "value": "application/json" }],
++        "body": { "mode": "raw", "raw": "{ \"email\": \"alice@example.com\", \"password\": \"alice-password\" }" },
++        "url": "{{baseUrl}}/login"
++      }
++    },
+     { "name": "Me", "request": { "method": "GET", "url": "{{baseUrl}}/me" } },
+     { "name": "List products", "request": { "method": "GET", "url": "{{baseUrl}}/products" } },
+     { "name": "List my orders", "request": { "method": "GET", "url": "{{baseUrl}}/orders" } }
+diff --git a/src/app.ts b/src/app.ts
+index c7a3c54..323503c 100644
+--- a/src/app.ts
++++ b/src/app.ts
+@@ -1,5 +1,6 @@
+ import express, { type NextFunction, type Request, type Response } from "express";
+ import { pool } from "./db.ts";
++import { hashPassword, verifyPassword } from "./passwords.ts";
+ 
+ export type User = { id: number; email: string; name: string; role: string };
+ 
+@@ -25,6 +26,27 @@ async function auth(req: Request, res: Response, next: NextFunction) {
+   next();
+ }
+ 
++const LOGIN_WINDOW = "15 minutes";
++const LOGIN_LIMIT_PER_ACCOUNT = 10;
++const LOGIN_LIMIT_PER_IP = 50;
++
++// Hash checked when the email is unknown, so an unknown account takes as long to refuse as a wrong password.
++const DUMMY_HASH = hashPassword("not-a-real-password");
++
++// Counts one attempt under `key` in the current window and returns the window's count so far.
++// One statement, so concurrent attempts can't both slip under the limit.
++async function countLoginAttempt(key: string): Promise<number> {
++  const { rows: [row] } = await pool.query(
++    `insert into login_attempts (key, n, window_start) values ($1, 1, now())
++     on conflict (key) do update set
++       n = case when login_attempts.window_start < now() - $2::interval then 1 else login_attempts.n + 1 end,
++       window_start = case when login_attempts.window_start < now() - $2::interval then now() else login_attempts.window_start end
++     returning n`,
++    [key, LOGIN_WINDOW],
++  );
++  return row.n;
++}
++
+ export function createApp() {
+   const app = express();
+   app.use(express.json());
+@@ -33,6 +55,30 @@ export function createApp() {
+     res.json({ ok: true });
+   });
+ 
++  // Open: this is how a client gets its token in the first place.
++  app.post("/login", async (req, res) => {
++    const { email, password } = req.body ?? {};
++    if (typeof email !== "string" || typeof password !== "string" || email === "" || password === "") {
++      return sendError(res, 400, "invalid_body", "Expected { email, password } as non-empty strings");
++    }
++
++    // Every attempt counts, right password or not, so a locked account stays locked until the window ends.
++    const accountCount = await countLoginAttempt(`login:email:${email.toLowerCase()}`);
++    const ipCount = await countLoginAttempt(`login:ip:${req.ip}`);
++    if (accountCount > LOGIN_LIMIT_PER_ACCOUNT || ipCount > LOGIN_LIMIT_PER_IP) {
++      return sendError(res, 429, "too_many_attempts", "Too many login attempts, try again later");
++    }
++
++    const { rows: [user] } = await pool.query(
++      "select api_token, password_hash from users where email = $1",
++      [email],
++    );
++    const ok = await verifyPassword(password, user?.password_hash ?? (await DUMMY_HASH));
++    if (!user || !ok) return sendError(res, 401, "invalid_credentials", "Wrong email or password");
++
++    res.json({ token: user.api_token });
++  });
++
+   app.use(auth);
+ 
+   app.get("/me", (_req, res) => {
+diff --git a/test/app.test.ts b/test/app.test.ts
+index d7b2ef4..65ef1d0 100644
+--- a/test/app.test.ts
++++ b/test/app.test.ts
+@@ -64,3 +64,39 @@ test("payments client records every call; the same idempotency key is charged on
+   const { rows } = await pool.query("select kind, count(*)::int as n from payment_calls where created_at > now() - interval '1 minute' group by kind order by kind");
+   assert.deepEqual(rows, [{ kind: "charge", n: 1 }, { kind: "refund", n: 1 }]);
+ });
++
++const login = (body: unknown) =>
++  fetch(`${base}/login`, {
++    method: "POST",
++    headers: { "content-type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("login with the right password returns the api_token, without a token", async () => {
++  const res = await login({ email: "alice@example.com", password: "alice-password" });
++  assert.equal(res.status, 200);
++  assert.deepEqual(await res.json(), { token: "alice-token" });
++});
++
++test("login with a wrong password and with an unknown email get the same 401", async () => {
++  const wrong = await login({ email: "alice@example.com", password: "nope" });
++  const unknown = await login({ email: "nobody@example.com", password: "nope" });
++  assert.equal(wrong.status, 401);
++  assert.equal(unknown.status, 401);
++  assert.deepEqual(await wrong.json(), await unknown.json());
++});
++
++test("login with a missing or non-string field is a 400", async () => {
++  const res = await login({ email: "alice@example.com" });
++  assert.equal(res.status, 400);
++  assert.equal((await res.json()).error.code, "invalid_body");
++});
++
++test("login is refused after too many wrong passwords, even with the right one", async () => {
++  for (let i = 0; i < 10; i++) {
++    assert.equal((await login({ email: "bob@example.com", password: "wrong" })).status, 401);
++  }
++  const res = await login({ email: "bob@example.com", password: "bob-password" });
++  assert.equal(res.status, 429);
++  assert.equal((await res.json()).error.code, "too_many_attempts");
++});

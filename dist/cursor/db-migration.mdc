@@ -37,12 +37,17 @@ Why: a plain `create index` blocks every write to the table until it finishes, w
 create index invoices_customer_id_idx on invoices (customer_id);
 
 -- Good: its own migration file, nothing else in it
-create index concurrently if not exists invoices_customer_id_idx on invoices (customer_id);
+create index concurrently invoices_customer_id_idx on invoices (customer_id);
 ```
 
 `concurrently` can't run inside a transaction. Many runners wrap each migration, or a multi-statement
 file, in one transaction, so keep the statement alone in its file (or use the runner's no-transaction
 option). The same goes for `drop index concurrently`.
+
+If the build fails (a deadlock, a duplicate in a unique index), Postgres keeps a broken INVALID index
+under that name. Don't add `if not exists`: the retry would skip it and leave it broken. Drop it with
+`drop index concurrently` and build again. Find leftovers with
+`select indexrelid::regclass from pg_index where not indisvalid`.
 
 ## 3. Don't hold a lock while waiting for one
 
@@ -51,11 +56,16 @@ the `alter table`. A one-millisecond change takes the API down.
 
 ```sql
 -- Good: give up quickly and retry the deploy rather than block the table
-set lock_timeout = '5s';
+set local lock_timeout = '5s';  -- "local": only until this migration's transaction ends
 alter table invoices add column note text;
 ```
 
-- New column with a constant default or nullable: fine. NOT NULL without a default on a table with rows: fails.
+A plain `set` stays on the connection after the migration, so the next query that reuses it gives up
+after 5 seconds too. If your runner doesn't run the migration in a transaction, `set local` does nothing:
+use `set`, then `reset lock_timeout` at the end.
+
+- New column that is nullable, or has a constant default (Postgres 11+; older versions rewrite the whole
+  table for a default): fine. NOT NULL without a default on a table with rows: fails.
 - New foreign key or CHECK on a big table: add it `not valid`, then `validate constraint` in a later
   migration. Validation doesn't block writes.
 
@@ -67,10 +77,15 @@ Why: one `update` over millions of rows holds row locks for its whole run and bl
 -- Bad: one statement, every row locked until it ends
 update customers set full_name = name;
 
--- Good: small batches, repeated until 0 rows (a script or job, outside the schema migration)
+-- Good: walk the table by id in small batches (a script or job, outside the schema migration).
+-- $1 starts at 0, then is the highest id the previous batch returned. Stop when a batch returns no rows.
 update customers set full_name = name
-where id in (select id from customers where full_name is null limit 5000);
+where id in (select id from customers where id > $1 order by id limit 5000)
+returning id;
 ```
+
+Move forward by id, not by "rows still empty". A row whose source is NULL stays empty after the update,
+so `where full_name is null` picks it again forever.
 
 ## 5. Rules live in the database
 
@@ -81,15 +96,16 @@ Use NOT NULL, foreign keys, UNIQUE (this is what stops duplicate rows when two r
 CHECK for ranges and allowed values (`check (seats between 1 and 10)`, `check (balance_cents >= 0)`).
 
 Rows that must never change once written (audit logs, ledgers, history) get a trigger that rejects
-UPDATE and DELETE:
+UPDATE, DELETE and TRUNCATE:
 
 ```sql
 create function audit_log_append_only() returns trigger language plpgsql as $$
 begin
   raise exception 'audit_log is append-only';
 end $$;
-create trigger audit_log_append_only before update or delete on audit_log
-  for each row execute function audit_log_append_only();
+-- "for each statement": TRUNCATE never fires row triggers
+create trigger audit_log_append_only before update or delete or truncate on audit_log
+  for each statement execute function audit_log_append_only();
 ```
 
 ## 6. Every migration can be undone, and is checked

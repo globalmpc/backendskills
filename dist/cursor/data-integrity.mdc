@@ -76,13 +76,19 @@ await client.query("commit");
 
 // Good: short write, call, short write
 const bookingId = await tx(async (c) => { await holdSeats(c, seats); return createBooking(c, "pending"); });
+let paymentId: string;
 try {
-  const { paymentId } = await payments.charge({ amountCents: total, idempotencyKey: `booking-${bookingId}` });
-  await pool.query("update bookings set status = 'paid', payment_id = $2 where id = $1", [bookingId, paymentId]);
+  ({ paymentId } = await payments.charge({ amountCents: total, idempotencyKey: `booking-${bookingId}` }));
 } catch (err) {
+  // No confirmed charge: give the seats back. If it went through after all (a timeout), the provider's
+  // charge.succeeded webhook finds a failed booking and refunds it (rule 5).
   await tx(async (c) => { await releaseSeats(c, seats); await markBooking(c, bookingId, "failed"); });
   return sendError(res, 502, "payment_failed", "Payment failed");
 }
+// Outside the try: the customer has paid, so a database error here must never release the seats.
+// The booking stays pending and the webhook marks it paid.
+await pool.query("update bookings set status = 'paid', payment_id = $2 where id = $1 and status = 'pending'",
+  [bookingId, paymentId]);
 ```
 
 ## 5. Anything that charges, refunds or sends gets an idempotency key
@@ -93,7 +99,8 @@ Why: a retry (by the client, a proxy, or your own code after a timeout) charges 
 - Change state only from the state you expect (`update bookings set status = 'cancelled' where id = $1 and
   status = 'paid'`), and act only if a row changed. Two cancellations at once must not both refund.
 - Events can arrive twice or out of order (webhooks, queue messages). Handling one must not move a record
-  back to an earlier state.
+  back to an earlier state. A `charge.succeeded` for a booking you already marked failed means a refund,
+  not a revived booking.
 
 ## 6. Test it with requests at once
 

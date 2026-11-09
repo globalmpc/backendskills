@@ -13,7 +13,8 @@
 A run fails when any hidden check fails. A **critical mistake** is a failed check on safety: data
 leaks, unlimited password guessing, overselling, double charges, deadlocks, migrations that break a
 live database. Missed team conventions (no down migration, endpoint not in the Postman collection) are
-counted separately. Runs where the agent itself errors (API error, usage limit, timeout) are left out.
+counted separately. Runs where the agent itself errors (API error, usage limit, timeout) are left out; `error_reason` in
+`runs.jsonl` says why.
 
 Every raw run is in [`results/`](results): the agent's diff, its output, the check
 output, the model, the Claude Code version, and the exact skill files the run used (`skills_hash`).

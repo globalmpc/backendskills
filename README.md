@@ -34,8 +34,18 @@ running against the new schema mid-deploy.
 | **All** | **12/75 → 2/75** | **13/75 → 0/75** |
 <!-- /RESULTS -->
 
-Runs with a critical mistake, without → with the skills. Missed team conventions (down migrations,
-API docs) went from 30 to 4. Not fixed yet: Haiku on out-of-order webhook events.
+Runs with a critical mistake, without → with the skills. Most of the gap is two tasks: `login-rate-limit`
+and `rename-column` account for 20 of the 25, and 10 of the 15 tasks had no critical mistake either way.
+Not fixed yet: Haiku on out-of-order webhook events.
+
+- **Team conventions** (down migrations, API docs): 30 misses → 4, with the sample app's conventions
+  written into each skill's "Make it yours" section ([`bench/skills-overlay`](bench/skills-overlay)). The
+  whole with-skills arm uses that version. As shipped, those lines say "not set".
+- **Cost:** with the skills the agent does more: $0.11 vs $0.06 per run, 23 vs 14 turns
+  (Sonnet $0.20 vs $0.12, Haiku $0.019 vs $0.012).
+- **Left out:** 25 runs stopped because the bench account hit its usage limit (`usage_limit_reached`):
+  20 Sonnet with-skills runs on `rename-column`, 1 on `orders-index`, 4 Opus. Each run's reason is its
+  `error_reason` in `runs.jsonl`. The 21 Opus runs there are a partial run, not part of the results.
 Every raw run, the tasks and how to rerun it are in [`bench/`](bench).
 
 ## Install

@@ -89,7 +89,7 @@ one() {
   jq -nc --arg run_id "$run_id" --arg task "$task" --arg condition "$condition" --argjson run "$n" \
     --argjson pass $pass --argjson failed "$failed" --arg model "$MODEL" --arg fake "${AGENT_CMD:+$(basename "${AGENT_CMD:-}")}" \
     --arg claude "$(claude --version 2>/dev/null | head -1)" --arg started "$started" --arg skills_hash "$skills_hash" \
-    --slurpfile agent <(jq -c '{total_cost_usd, num_turns, duration_ms, agent_error: (.is_error // false)}' "$out/agent.json" 2>/dev/null || echo '{}') \
+    --slurpfile agent <(jq -c '{total_cost_usd, num_turns, duration_ms, agent_error: (.is_error // false), error_reason: (if .is_error then (.api_error // "unknown") else null end)}' "$out/agent.json" 2>/dev/null || echo '{}') \
     '{run_id: $run_id, task: $task, condition: $condition, run: $run, pass: $pass, failed: $failed, model: $model,
       claude_code: $claude, started_at: $started,
       skills_hash: (if $skills_hash == "" then null else $skills_hash end)}

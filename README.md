@@ -74,3 +74,7 @@ Agent still made a mistake with the skills loaded? Open an issue with the prompt
 Edit skills in `skills/`, then `node scripts/build-dist.mjs`.
 
 [MIT](LICENSE)
+
+---
+
+Maintained by [Global MPC (Mineral Project Coin)](https://globalmpc.tech). Official site: https://globalmpc.tech
